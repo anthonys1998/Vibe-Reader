@@ -156,7 +156,7 @@ class WebNovelJobPersistenceTest {
         assertNull(repository.claimAutomaticWebNovelJob(cancelQueued.id))
     }
 
-    @Test fun workerContinuationKeepsQueuedForegroundJobsFromBeingStranded() = runBlocking {
+    @Test fun workerContinuationKeepsQueuedForegroundJobsFromBeingStranded() = runBlocking<Unit> {
         val repository = BookRepository(context, database.bookDao())
         val first = repository.enqueueWebNovelConversion("https://example.org/first", WebNovelScrapeOptions(), "default")
         val second = repository.enqueueWebNovelConversion("https://example.org/second", WebNovelScrapeOptions(), "default")
@@ -173,7 +173,7 @@ class WebNovelJobPersistenceTest {
         repository.interruptWebNovelJob(second.id, requireNotNull(queuedClaim.runnerToken))
     }
 
-    @Test fun orphanWorkerLeaseRecoversButLiveForegroundLeaseIsNeverStolen() = runBlocking {
+    @Test fun orphanWorkerLeaseRecoversButLiveForegroundLeaseIsNeverStolen() = runBlocking<Unit> {
         val dao = database.bookDao()
         val repository = BookRepository(context, dao)
         val live = repository.enqueueWebNovelConversion("https://example.org/live", WebNovelScrapeOptions(), "default")
