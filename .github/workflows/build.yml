@@ -19,11 +19,9 @@ on:
 permissions:
   contents: read
 
-# Fixed compatibility baseline from the latest published Actions APK. Keep the
-# signer pin fail-closed until the APK certificate and matching key are verified.
+# Keep signed APK version codes above the latest previously published build.
 env:
   UPDATE_BASELINE_VERSION_CODE: '106'
-  UPDATE_BASELINE_CERT_SHA256: 'c62965fc3065cd32b7b6f84c2bddbc12f1e667a7951fe298f3882343409419fe'
 
 jobs:
   debug-apk:
@@ -85,8 +83,16 @@ jobs:
             app/build/test-results/
           if-no-files-found: ignore
 
-      - name: Build and verify compatible update APK
-        id: compatible_update
+      - name: Reject release dispatch from an untrusted branch
+        if: >-
+          github.event_name == 'workflow_dispatch' && inputs.build_release &&
+          github.ref != 'refs/heads/main' && github.ref != 'refs/heads/anthonys1998-Groq'
+        run: |
+          echo "::error::Signed releases can only be dispatched from main or anthonys1998-Groq."
+          exit 1
+
+      - name: Build and verify signed APK
+        id: signed_apk
         if: >-
           (github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/anthonys1998-Groq')) ||
@@ -97,37 +103,43 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_EXPECTED_CERT_SHA256: ${{ secrets.ANDROID_EXPECTED_CERT_SHA256 }}
+          BUILD_RELEASE_REQUEST: ${{ inputs.build_release }}
           RELEASE_VERSION_CODE: ${{ inputs.release_version_code }}
         run: |
           set -euo pipefail
           set +x
           is_push=false
+          is_release_request=false
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then is_push=true; fi
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$BUILD_RELEASE_REQUEST" == "true" ]]; then is_release_request=true; fi
           missing=()
-          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_EXPECTED_CERT_SHA256; do
             if [[ -z "${!name:-}" ]]; then missing+=("$name"); fi
           done
           if (( ${#missing[@]} > 0 )); then
-            if [[ "$is_push" == true ]]; then
-              echo "::warning::Compatible update APK skipped: original signing credentials are not configured."
-              echo "No installable APK was published. Tests and debug compilation still ran." >> "$GITHUB_STEP_SUMMARY"
-              echo "built=false" >> "$GITHUB_OUTPUT"
-              exit 0
+            if [[ "$is_release_request" == true ]]; then
+              echo "::error::Signed release requested, but signing credentials or ANDROID_EXPECTED_CERT_SHA256 are not configured."
+              echo "The requested signed release was not produced. Configure the keystore secrets and expected certificate fingerprint, then rerun." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
-            echo "::error::An explicit release requires all four existing signing secrets: ${missing[*]}."
-            exit 1
+            echo "::warning::Signed APK skipped: signing credentials or ANDROID_EXPECTED_CERT_SHA256 are not configured."
+            echo "A Paperlight-debug APK will be uploaded. It uses the runner debug key and may not update an APK signed with a different key." >> "$GITHUB_STEP_SUMMARY"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          expected_cert=$(printf '%s' "$UPDATE_BASELINE_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          expected_cert=$(printf '%s' "$ANDROID_EXPECTED_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
           if ! [[ "$expected_cert" =~ ^[0-9a-f]{64}$ ]]; then
-            if [[ "$is_push" == true ]]; then
-              echo "::warning::Compatible update APK skipped: the verified baseline certificate pin is not configured."
-              echo "No installable APK was published. The signer pin must be verified against the latest Actions artifact first." >> "$GITHUB_STEP_SUMMARY"
-              echo "built=false" >> "$GITHUB_OUTPUT"
-              exit 0
+            if [[ "$is_release_request" == true ]]; then
+              echo "::error::Signed release requested, but ANDROID_EXPECTED_CERT_SHA256 is not a SHA-256 certificate fingerprint."
+              echo "The requested signed release was not produced. Correct the expected certificate fingerprint and rerun." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
-            echo "::error::Explicit release is blocked until the latest artifact signer is pinned."
-            exit 1
+            echo "::warning::Signed APK skipped: ANDROID_EXPECTED_CERT_SHA256 is not a SHA-256 certificate fingerprint."
+            echo "A Paperlight-debug APK will be uploaded instead; no unsigned or unverified signed APK will be published." >> "$GITHUB_STEP_SUMMARY"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           if [[ "$is_push" == true ]]; then
@@ -150,8 +162,8 @@ jobs:
           PY
           then
             if [[ "$is_push" == true ]]; then
-              echo "::warning::Compatible update APK skipped: this run's versionCode does not exceed baseline 106."
-              echo "No installable APK was published because its versionCode must be greater than 106." >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Signed APK skipped: this run's versionCode does not exceed the existing versionCode floor 106."
+              echo "A Paperlight-debug APK will be uploaded instead." >> "$GITHUB_STEP_SUMMARY"
               echo "built=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -176,26 +188,34 @@ jobs:
           badging = subprocess.run([aapt, "dump", "badging", apk], check=True, capture_output=True, text=True).stdout
           package = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)'", badging, re.M)
           if not package or package.group(1) != "com.paperlight.reader":
-              sys.exit("Update APK has an unexpected or unreadable application ID.")
+              sys.exit("Release APK has an unexpected or unreadable application ID.")
           if package.group(2) != os.environ["RELEASE_VERSION_CODE"]:
-              sys.exit("Update APK versionCode does not match the selected version code.")
+              sys.exit("Release APK versionCode does not match the selected version code.")
           if int(package.group(2)) <= int(os.environ["UPDATE_BASELINE_VERSION_CODE"]):
-              sys.exit("Update APK versionCode does not exceed the latest artifact baseline.")
+              sys.exit("Release APK versionCode does not exceed the existing versionCode floor.")
           signature = subprocess.run([apksigner, "verify", "--verbose", "--print-certs", apk],
                                      check=True, capture_output=True, text=True)
           signer_output = signature.stdout + signature.stderr
           actual = re.search(r"Signer #1 certificate SHA-256 digest:\s*([0-9A-Fa-f:]+)", signer_output)
-          expected = os.environ["UPDATE_BASELINE_CERT_SHA256"].replace(":", "").strip().lower()
+          expected = os.environ["ANDROID_EXPECTED_CERT_SHA256"].replace(":", "").strip().lower()
           if not actual or actual.group(1).replace(":", "").lower() != expected:
-              sys.exit("Update APK signer does not match the pinned latest-artifact certificate.")
-          print("Compatible update APK package, versionCode, and signer verified.")
+              sys.exit("Release APK signer does not match ANDROID_EXPECTED_CERT_SHA256.")
+          print("Signed APK package, versionCode, and signer verified.")
           PY
           echo "built=true" >> "$GITHUB_OUTPUT"
 
-      - name: Upload compatible APK
-        if: steps.compatible_update.outputs.built == 'true'
+      - name: Upload signed APK
+        if: steps.signed_apk.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.build_release && 'Paperlight-release' || 'Paperlight-update' }}
+          name: Paperlight-release
           path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload debug APK
+        if: steps.signed_apk.outputs.built != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Paperlight-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

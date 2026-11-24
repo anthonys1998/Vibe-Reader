@@ -2,27 +2,28 @@
 
 Statuses: **Complete** means implemented and checked; **Partial** means the existing feature covers some of the request or an external compatibility check remains; **Pending** means work remains. Backup/restore redesign is excluded. Extending its existing format to preserve new durable job/source data is included as a compatibility task.
 
-**CI validation (2026-11-24):** [GitHub Actions run 45302865490](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45302865490) succeeded on commit 864095fd36603570b689d771342f5436104866d0. Workflow execution, unit tests, and the debug APK build passed. The compatible-update step reported that signing credentials were not configured and uploaded no APK. Java and Gradle remain unavailable locally; device verification and the secrets-gated signed build are still pending.
+**CI validation (2026-11-24):** [GitHub Actions run 45302865490](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45302865490) succeeded on commit 864095fd36603570b689d771342f5436104866d0. Workflow execution, unit tests, and debug APK assembly passed. That run used the earlier workflow, which did not upload the debug APK when signing credentials were absent. The debug-fallback and configurable-signer workflow changes below still need a new CI run. Java and Gradle remain unavailable locally; device verification and the secrets-gated signed build are pending.
 
 ## 1. APK update continuity and release hardening — Partial
 
-**Existing facts:** The application ID is com.paperlight.reader; the existing signing secrets are ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD. Local builds default to version code 41; CI builds use workflow run number plus 40. The latest available APK artifact came from Actions run #66; it was a debug APK with version code 106 and Android Debug signer SHA-256 c62965fc3065cd32b7b6f84c2bddbc12f1e667a7951fe298f3882343409419fe.
+**Existing facts:** The application ID is com.paperlight.reader; the signing inputs are ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD, and ANDROID_EXPECTED_CERT_SHA256. Local builds default to version code 41; CI builds use workflow run number plus 40. The latest available APK artifact came from Actions run #66; it was a debug APK with version code 106 and Android Debug signer SHA-256 c62965fc3065cd32b7b6f84c2bddbc12f1e667a7951fe298f3882343409419fe. The user waived continuity with that old debug key. Version code 106 remains the minimum historical floor for signed releases; the old signer is not pinned.
 
-**Changes in Phase 1:** Push and pull-request runs test and compile debug but do not upload a debug APK. Trusted direct pushes may upload a signed Paperlight-update only when all four existing credentials are configured and the APK passes package, version, and fixed signer checks. Missing credentials produce a warning and no installable APK; a mismatch fails closed. Manual releases require an explicit version code greater than 106 and use the same pinned signer. The fixed baseline cannot be overridden by a dispatch input. The temporary keystore is removed by a shell trap. No key is generated or rotated, and secrets are not changed.
+**Changes in Phase 1:** Pushes and pull requests test and assemble debug. The workflow uploads a clearly named Paperlight-debug artifact when no signed build is produced; it retains the same application ID and may use a per-run debug key, so it may not update an installation signed with another key. On trusted direct pushes or an explicit signed-release dispatch from a trusted branch, a signed APK is uploaded only after package, version, and signer checks against ANDROID_EXPECTED_CERT_SHA256. Missing signing values on an ordinary push result in the debug artifact; an explicit signed-release request fails clearly if values are missing or the expected fingerprint is malformed. A key whose actual signer differs from the configured fingerprint fails closed. Manual releases require a version code greater than 106 and any installed version intended to be updated. The temporary keystore is removed by a shell trap. No key is generated or rotated, and secrets are not changed.
 
-**Still unverified:** The run #66 signer certificate was extracted; the downloaded artifact ZIP matched GitHub's recorded artifact digest. the APK signature was not independently validated. The artifact does not contain its private key. It is not yet known whether the configured keystore secrets have a key matching that certificate. Without the matching private key, no later APK can update the latest artifact. No on-device update/install has been verified.
+**Still unverified:** The run #66 signer certificate was extracted; the downloaded artifact ZIP matched GitHub's recorded artifact digest. The APK signature was not independently validated. The old artifact does not contain its private key, and continuity with it is no longer required. The newly configured expected signer, stable keystore availability, debug artifact upload, signed artifact production, and all on-device install/update behavior remain unverified.
 
 **Checklist:**
 - [x] Inspect the latest available Actions APK artifact identity and record its package, version code, and signer fingerprint.
-- [x] Stop uploading fresh-key debug APKs; keep tests/debug compilation and upload only a signed artifact verified against the fixed baseline.
-- [x] Require manual release version codes above the artifact baseline; remove caller-supplied baseline and signer overrides.
+- [x] Keep the application ID unchanged and upload a clearly named debug APK when no signed APK is produced.
+- [x] Require signed APKs to match the configured expected certificate and use a version code above 106; remove caller-supplied signer/baseline overrides.
+- [x] Make an explicit manual signed-release request fail clearly when signing credentials or a valid expected certificate are missing.
 - [x] Check `git diff --check`, shell syntax for release scripts, embedded Python syntax, and validator accept/reject behavior.
 - [x] Run CI unit tests and debug build; the workflow parsed and executed in run 45302865490.
-- [x] Verify the missing-signing-credentials path warns and publishes no installable APK in run 45302865490.
-- [ ] Run the signed-update path with matching credentials and verify package, version, signer, and an on-device update.
-- [ ] Confirm the existing keystore contains the private key matching the pinned certificate and verify an update on device.
+- [x] Add a Paperlight-debug artifact fallback when a signed build is not produced; verify the step conditions and failure behavior statically.
+- [ ] Run the signed-release path with configured credentials and verify package, version, and signer.
+- [ ] Verify APK installation/update behavior on devices; a debug APK with a different key may require uninstalling the existing app.
 
-**Status:** Partial: CI and fail-closed no-key behavior passed; matching private-key availability, independent baseline signature validation, signed artifact production, and device update compatibility remain unverified.
+**Status:** Partial: prior CI tests and debug assembly passed. The new debug-artifact fallback and explicit release failure path are implemented and statically checked; a new Actions artifact, configured-signer release, and device installation have not yet been verified.
 
 ## 2. Durable website-to-EPUB conversion engine — Partial
 
@@ -107,8 +108,9 @@ The notes screen already allows editing and saving a generated summary locally. 
 
 ## Verification checklist
 
-- [x] CI run 45302865490 parsed and executed the workflow; unit tests and debug build passed. Missing signing credentials caused a warning and no APK publication.
-- [ ] Run the signed release path with the matching key; validate package/version/signer, independently validate the baseline artifact signature, and verify an in-place update on device.
+- [x] CI run 45302865490 parsed and executed the earlier workflow; unit tests and debug build passed. That workflow did not upload the debug APK when signing credentials were missing.
+- [ ] Validate the updated workflow and download the debug or signed APK artifact from a new Actions run.
+- [ ] Run the signed release path with configured credentials; validate package/version/signer and verify installation behavior on device.
 - [x] Phases 2–3: add tests for exclusive claims, stale-token progress/finalization, process-death pause reconciliation, v4→v8 migrations, shared Worker/foreground leases, pause/cancel intent, cooldown persistence, Work scheduling and cached Worker import, changed-TOC manifest reuse, redirect origin validation, corrupt-manifest reset, cache preservation, and backup round-trip/legacy/path/hash/collision/rollback behavior (backup tests passed in CI run 45302865490).
 - [ ] Verify numeric/date 429 cooldowns, atomic checkpoint retry, cancel/retry, service process-death recovery, duplicate prevention/idempotent import, and backup/restore job/source compatibility on Android devices.
 - [x] Phase 4: add fixtures for Standard Ebooks, custom OPDS/HTML parsing, cache bounds, EPUB validation, source lifecycle/migrations, repeated-card selector inference, both heading/link layouts, lazy covers, mode/search configuration, challenge rejection, and rendered-document URL/size bounds (passed in CI run 45302865490).
