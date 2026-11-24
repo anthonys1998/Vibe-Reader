@@ -7,7 +7,8 @@ Vibe Reader is an Android ebook library and reader. Books are imported into app-
 - Read EPUB, PDF, TXT, MOBI, AZW/AZW3, CBZ, and CBR books. DRM-protected books and KFX are not supported.
 - Organize books in named libraries; search, sort, filter, and track reading progress.
 - Use EPUB contents, bookmarks, highlights, notes, text search, text-to-speech, adjustable reading controls, and accessibility settings. PDF and comics support page navigation and zoom.
-- Discover books from Standard Ebooks, optional Project Gutenberg, and configurable OPDS or HTML sources. Review discovered HTML books in the website-to-EPUB converter before importing.
+- Discover books from Standard Ebooks, optional Project Gutenberg, and configurable OPDS or HTML sources. For custom sources, choose whether Add downloads an available EPUB or opens Website to EPUB directly.
+- Configure custom HTML listing selectors with Groq suggestions and save converter scraper settings per website. Cover thumbnails use bounded in-memory caches, and local book covers appear in library rows.
 - Queue website-to-EPUB conversions, pause/resume/cancel them, and recover from interruptions using saved chapter checkpoints. Android may delay background work.
 - Back up and restore books, reading data, settings, discovery sources, and conversion checkpoints. Export a book in its original format or share its original file. Including the Groq API key in a backup requires a password and encrypts the key.
 - Generate note summaries with Groq, then edit and save them locally. Summary generation uses the network; saved summaries can be read and edited offline. Regenerating after manual edits requires confirmation.

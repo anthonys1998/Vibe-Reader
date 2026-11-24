@@ -67,7 +67,7 @@ The Room schema is now version 8 with explicit migrations and no destructive fal
 
 ## 4. Discover sources, website detection, and converter handoff — Partial
 
-**Implemented:** Standard Ebooks is the default public HTML catalog with Latest, Popular, Browse, paging, and title/author search. Project Gutenberg remains optional. Room migration 6→7 creates a source registry and seeds built-ins only for new databases or existing installs at migration time; custom sources can be detected, added, edited, enabled/disabled, refreshed, and deleted. The catalog client parses Standard Ebooks cards, Atom OPDS acquisitions/navigation/next links, and configurable HTML card selectors; it keeps one bounded cache per source, validates HTTP(S) URLs/redirects, bounds responses and images, and rejects invalid EPUB downloads before import. HTML result cards offer a review handoff into the existing converter. Fixture tests cover Standard metadata/paging, namespaced OPDS navigation/acquisitions, custom HTML cards, cache bounds/full URL round-trip, and EPUB MIME entry bounds; migration and source lifecycle fixtures are also present.
+**Implemented:** Standard Ebooks is the default public HTML catalog with Latest, Popular, Browse, paging, and title/author search. Project Gutenberg remains optional. Room migration 6→7 creates a source registry and seeds built-ins only for new databases or existing installs at migration time; custom sources can be detected, added, edited, enabled/disabled, refreshed, and deleted. The catalog client parses Standard Ebooks cards, Atom OPDS acquisitions/navigation/next links, and configurable HTML card selectors; it keeps one bounded cache per source, validates HTTP(S) URLs/redirects, bounds responses and images, and rejects invalid EPUB downloads before import. Custom source purpose controls whether Add downloads an EPUB or opens the website-to-EPUB converter; built-in catalogs keep direct download behavior. Fixture tests cover Standard metadata/paging, namespaced OPDS navigation/acquisitions, custom HTML cards, cache bounds/full URL round-trip, and EPUB MIME entry bounds; migration and source lifecycle fixtures are also present.
 
 **Additional Phase 4 implementation:** Public HTML detection now scores bounded repeated card containers, skips navigation/pagination/comment/social regions, infers title/detail/author/lazy-cover selectors, and previews up to four parsed titles. Detected selectors and optional search, Latest, and Popular same-origin URLs remain editable; a Preview action runs the current saved-in-editor configuration. HTML sources can explicitly opt into the existing `RenderedNovelPage` for JavaScript listings and details. Discovery snapshots are capped at 1 MiB in UTF-8 and JavaScript characters, run for at most 25 seconds, validate the final HTTP(S) URL, and are destroyed on cancellation. HTTP 401/403 and recognized sign-in/browser challenge pages fail visibly; the WebView is not used as a retry to bypass those responses. The converter's default 8-million-character renderer limit is preserved. Old `configJson` values decode with JavaScript rendering off, no custom mode URLs, and no inferred-region filtering, preserving manual selector behavior; the discovery registry is still created by migration 6→7, while Room v8 adds the job and recovery fields.
 
@@ -78,7 +78,7 @@ The Room schema is now version 8 with explicit migrations and no destructive fal
 **Checklist:**
 - [x] Make Standard Ebooks the default and retain optional Project Gutenberg.
 - [x] Add source migration/initial seeding, source CRUD, enable/disable, refresh, and Browse.
-- [x] Add public Standard latest/popular/search/paging, custom Atom OPDS and editable HTML selectors, bounded result cache, validation, and converter review handoff.
+- [x] Add public Standard latest/popular/search/paging, custom Atom OPDS and editable HTML selectors, bounded result cache, validation, and purpose-based direct-download/converter Add routing.
 - [x] Add parser, cache, EPUB validation, migration, and source lifecycle fixture tests (passed in CI run 45302865490).
 - [x] Add backward-compatible backup/restore for source definitions, cached results, and built-in enabled flags (tests passed in CI run 45302865490).
 - [x] Add best-effort repeated HTML card/title/link/cover/search/Latest/Popular detection, editable selector/mode configuration, parsed-title preview, and explicit bounded reuse of the rendered WebView fallback (fixtures passed in CI run 45302865490).
@@ -116,3 +116,13 @@ The notes screen already allows editing and saving a generated summary locally. 
 - [x] Phase 4: add fixtures for Standard Ebooks, custom OPDS/HTML parsing, cache bounds, EPUB validation, source lifecycle/migrations, repeated-card selector inference, both heading/link layouts, lazy covers, mode/search configuration, challenge rejection, and rendered-document URL/size bounds (passed in CI run 45302865490).
 - [ ] Phase 4: verify rendered catalog fallback, selector detection, cancellation, unsafe URLs, and converter handoff on Android devices.
 - [ ] Phase 5: run Android checks for details/export/share, document picker rename/destination, MIME and URI access for each format; test summary edits and regeneration confirmation plus existing backup compatibility.
+
+## Discover follow-up fixes — Partial
+
+- [x] Standard Ebooks downloads use the `?source=download` response instead of its HTML interstitial; a live download was verified as an EPUB file.
+- [x] Custom source purpose is independent of HTML/OPDS transport and defaults legacy sources to direct EPUB download. Add follows the saved purpose; Groq can suggest HTML listing selectors, and converter scraper settings are saved per website.
+- [x] Cache discovery cover thumbnails and local book artwork in bounded memory; library rows can use cached local artwork.
+- [ ] Run follow-up CI unit tests/debug build and verify APK artifact.
+- [ ] Verify purpose-based Add routing, saved converter profiles, and cover display on an Android device.
+
+**Status:** Partial: implementation and live Standard Ebooks download verification are complete; follow-up CI and device checks remain.

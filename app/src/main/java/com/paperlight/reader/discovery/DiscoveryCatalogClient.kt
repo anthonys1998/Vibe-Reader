@@ -4,7 +4,9 @@ import android.content.Context
 import android.net.Uri
 import com.paperlight.reader.data.DiscoverySourceEntity
 import com.paperlight.reader.data.DiscoverySourceKind
+import com.paperlight.reader.data.WebNovelScrapeOptionsJson
 import com.paperlight.reader.webnovel.RenderedNovelPage
+import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -32,6 +34,13 @@ data class DiscoveryBook(
 
 data class DiscoveryLink(val title: String, val url: String)
 
+object DiscoverySourcePurpose {
+    const val DOWNLOAD_EPUB = "DOWNLOAD_EPUB"
+    const val CONVERT_WEBSITE = "CONVERT_WEBSITE"
+
+    fun isValid(value: String): Boolean = value == DOWNLOAD_EPUB || value == CONVERT_WEBSITE
+}
+
 data class DiscoveryPage(
     val books: List<DiscoveryBook>,
     val collections: List<DiscoveryLink> = emptyList(),
@@ -51,7 +60,11 @@ data class DiscoverySourceConfig(
     val htmlPopularUrl: String = "",
     val renderJavaScript: Boolean = false,
     val excludeNonCatalogRegions: Boolean? = null,
+    val purpose: String = DiscoverySourcePurpose.DOWNLOAD_EPUB,
+    val scrapeOptions: WebNovelScrapeOptions = WebNovelScrapeOptions(),
 )
+
+internal data class DiscoveryHtmlAiSample(val finalUrl: String, val html: String)
 
 data class DetectedDiscoverySource(
     val kind: String,
@@ -78,6 +91,8 @@ object DiscoverySourceConfigCodec {
         .put("htmlLatestUrl", value.htmlLatestUrl)
         .put("htmlPopularUrl", value.htmlPopularUrl)
         .put("renderJavaScript", value.renderJavaScript)
+        .put("purpose", value.purpose)
+        .put("scrapeOptions", org.json.JSONObject(WebNovelScrapeOptionsJson.encode(value.scrapeOptions)))
         .apply { value.excludeNonCatalogRegions?.let { put("excludeNonCatalogRegions", it) } }
         .toString()
 
@@ -96,6 +111,11 @@ object DiscoverySourceConfigCodec {
             renderJavaScript = value.optBoolean("renderJavaScript", false),
             excludeNonCatalogRegions = if (value.has("excludeNonCatalogRegions") && !value.isNull("excludeNonCatalogRegions"))
                 value.optBoolean("excludeNonCatalogRegions") else null,
+            purpose = value.optString("purpose", DiscoverySourcePurpose.DOWNLOAD_EPUB)
+                .takeIf(DiscoverySourcePurpose::isValid) ?: DiscoverySourcePurpose.DOWNLOAD_EPUB,
+            scrapeOptions = runCatching {
+                value.optJSONObject("scrapeOptions")?.let { WebNovelScrapeOptionsJson.decode(it.toString()) }
+            }.getOrNull() ?: WebNovelScrapeOptions(),
         )
     }.getOrDefault(DiscoverySourceConfig())
 }
@@ -167,6 +187,72 @@ object DiscoveryCatalogClient {
     private const val MAX_CATALOG_BYTES = 1_000_000
     private const val MAX_EPUB_BYTES = 80L * 1024 * 1024
     private const val USER_AGENT = "VibeReader/1.1 (Android EPUB reader)"
+
+    internal suspend fun htmlSampleForAi(
+        url: String,
+        renderJavaScript: Boolean,
+        renderedContext: Context?,
+    ): DiscoveryHtmlAiSample = withContext(Dispatchers.IO) {
+        val document: Document
+        val finalUrl: String
+        if (renderJavaScript) {
+            val context = renderedContext ?: error("Open the source editor to render this public listing.")
+            val rendered = RenderedNovelPage(context, MAX_CATALOG_BYTES).load(validateHttpUrl(url)) { page ->
+                validateRenderedDocument(page)
+                page.body()?.text()?.isNotBlank() == true
+            }
+            finalUrl = validateRenderedDocument(rendered)
+            document = rendered
+        } else {
+            val response = fetchDocument(url)
+            require(!looksLikeOpds(response.document, response.contentType)) {
+                "AI book-list selector setup is for HTML sources. OPDS catalogs do not need CSS selectors."
+            }
+            document = response.document
+            finalUrl = response.finalUrl
+        }
+        requirePublicCatalogDocument(document)
+        require(!looksLikeOpds(document, "")) {
+            "AI book-list selector setup is for HTML sources. OPDS catalogs do not need CSS selectors."
+        }
+        val sample = sanitizedCatalogSample(document)
+        require(sample.isNotBlank()) { "This page has no public HTML to configure." }
+        DiscoveryHtmlAiSample(finalUrl, sample)
+    }
+
+    internal fun validateAiDiscoveryConfig(
+        finalUrl: String,
+        sampleHtml: String,
+        config: DiscoverySourceConfig,
+    ) {
+        require(config.htmlBookSelector.isNotBlank() && config.htmlTitleSelector.isNotBlank() &&
+            config.htmlDetailLinkSelector.isNotBlank() && config.htmlBookSelector.length <= 1_000 &&
+            config.htmlTitleSelector.length <= 1_000 && config.htmlDetailLinkSelector.length <= 1_000 &&
+            config.htmlAuthorSelector.length <= 1_000 && config.htmlCoverSelector.length <= 1_000 &&
+            config.htmlEpubLinkSelector.length <= 1_000) {
+            "The suggested book-list selectors are missing or exceed the size limit."
+        }
+        if (config.searchUrlTemplate.isNotBlank()) {
+            val expanded = expandSearchTemplate(config.searchUrlTemplate, "catalog-validation")
+            require(sameOrigin(finalUrl, expanded)) { "The search URL must stay on the same website as the source." }
+        }
+        configuredModeUrl(finalUrl, config.htmlLatestUrl, "Latest")
+        configuredModeUrl(finalUrl, config.htmlPopularUrl, "Popular")
+        val document = Jsoup.parse(sampleHtml, finalUrl)
+        listOf(config.htmlBookSelector, config.htmlTitleSelector, config.htmlAuthorSelector,
+            config.htmlDetailLinkSelector, config.htmlCoverSelector, config.htmlEpubLinkSelector)
+            .filter(String::isNotBlank).forEach { selector ->
+                try {
+                    document.select(selector)
+                } catch (failure: Exception) {
+                    throw IllegalArgumentException("The suggested CSS selector is invalid: ${failure.message}")
+                }
+            }
+        val parsed = parseHtmlList(sampleHtml, finalUrl, config)
+        require(parsed.books.isNotEmpty()) {
+            "The suggested selectors did not find a book card in the sample. Review them or enter selectors manually."
+        }
+    }
 
     suspend fun detectSource(url: String, name: String = "", renderedContext: Context? = null,
         renderJavaScript: Boolean = false): DetectedDiscoverySource = withContext(Dispatchers.IO) {
@@ -562,7 +648,7 @@ object DiscoveryCatalogClient {
         return resolved
     }
 
-    private fun sameOrigin(first: String, second: String): Boolean = runCatching {
+    internal fun sameOrigin(first: String, second: String): Boolean = runCatching {
         val a = URI(first)
         val b = URI(second)
         val aPort = if (a.port >= 0) a.port else if (a.scheme.equals("https", true)) 443 else 80
@@ -606,7 +692,11 @@ object DiscoveryCatalogClient {
             }
             if (acquisition != null) {
                 val epub = safeResolve(safeBaseUrl, acquisition.attr("href")) ?: return@forEach
-                books += DiscoveryBook(id.ifBlank { epub }, title, author, epub, cover, epub)
+                val htmlDetails = links.firstOrNull { link ->
+                    link.attr("rel").contains("alternate", true) &&
+                        link.attr("type").substringBefore(';').trim().lowercase() in setOf("text/html", "application/xhtml+xml")
+                }?.attr("href")?.let { safeResolve(safeBaseUrl, it) }
+                books += DiscoveryBook(id.ifBlank { epub }, title, author, htmlDetails ?: epub, cover, epub)
             } else if (navigation != null) {
                 val target = safeResolve(safeBaseUrl, navigation.attr("href")) ?: return@forEach
                 collections += DiscoveryLink(title, target)
@@ -639,7 +729,17 @@ object DiscoveryCatalogClient {
         val absolute = safeResolve(response.finalUrl, candidate)
             ?: error("The EPUB link is not a safe HTTP(S) URL.")
         require(isStandardEbooksHost(URI(absolute).host.orEmpty())) { "The EPUB link left Standard Ebooks." }
-        return absolute
+        return standardEpubDownloadUrl(absolute)
+    }
+
+    internal fun standardEpubDownloadUrl(url: String): String {
+        val uri = Uri.parse(url)
+        val preservedParameters = uri.encodedQuery.orEmpty().takeIf(String::isNotEmpty)
+            ?.split('&')
+            ?.filterNot { parameter -> Uri.decode(parameter.substringBefore('=')) == "source" }
+            .orEmpty()
+        val query = (preservedParameters + "source=download").joinToString("&")
+        return uri.buildUpon().encodedQuery(query).build().toString()
     }
 
     private suspend fun htmlEpubUrl(detailsUrl: String, config: DiscoverySourceConfig, renderedContext: Context?): String {
@@ -696,6 +796,28 @@ object DiscoveryCatalogClient {
     }
 
     private data class FetchedDocument(val document: Document, val finalUrl: String, val contentType: String)
+
+    private fun sanitizedCatalogSample(document: Document): String {
+        val sample = document.clone()
+        sample.select("script, style, noscript, svg, iframe, object, embed, form, nav, footer, header, aside, video, audio, source, link, meta").remove()
+        sample.select("*").forEach { element ->
+            val allowed = setOf("class", "id", "role", "itemprop", "itemtype", "typeof", "property", "rel", "href", "src", "title")
+            element.attributes().asList().map { it.key }.forEach { key ->
+                val safeDataAttribute = key.startsWith("data-") || key.startsWith("aria-")
+                if (key !in allowed && !safeDataAttribute) {
+                    element.removeAttr(key)
+                } else if (key == "href" || key == "src" || key.endsWith("-src") || key.endsWith("-href")) {
+                    val raw = element.attr(key)
+                    val path = runCatching { URI(raw).rawPath }.getOrNull()
+                    if (path.isNullOrBlank()) element.attr(key, if (raw.startsWith("#")) "#" else "/")
+                    else element.attr(key, path.take(240))
+                } else if (element.attr(key).length > 240) {
+                    element.attr(key, element.attr(key).take(240))
+                }
+            }
+        }
+        return sample.body()?.html()?.take(12_000).orEmpty()
+    }
 
     private suspend fun fetchDocument(url: String): FetchedDocument = withContext(Dispatchers.IO) {
         val safeUrl = validateHttpUrl(url)
@@ -768,7 +890,7 @@ object DiscoveryCatalogClient {
     private fun isStandardEbooksHost(host: String): Boolean =
         host.equals("standardebooks.org", true) || host.endsWith(".standardebooks.org", true)
 
-    private suspend fun streamEpub(url: String, destination: File) = withContext(Dispatchers.IO) {
+    internal suspend fun streamEpub(url: String, destination: File) = withContext(Dispatchers.IO) {
         val safeUrl = validateHttpUrl(url)
         val connection = URL(safeUrl).openConnection() as HttpURLConnection
         try {

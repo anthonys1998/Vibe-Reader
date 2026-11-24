@@ -13,6 +13,9 @@ import com.paperlight.reader.webnovel.WebNovelChapterManifestCodec
 import com.paperlight.reader.webnovel.WebNovelChapterManifestStore
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import com.paperlight.reader.webnovel.WebNovelWorkerSliceYieldException
+import com.paperlight.reader.discovery.DiscoveryCatalogClient
+import com.paperlight.reader.discovery.DiscoverySourceConfigCodec
+import com.paperlight.reader.discovery.DiscoverySourcePurpose
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
@@ -551,6 +554,18 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
                 "Only detected OPDS catalogs and HTML websites can be added as custom sources."
             }
             val config = org.json.JSONObject(source.configJson)
+            val purpose = config.optString("purpose", DiscoverySourcePurpose.DOWNLOAD_EPUB)
+            require(DiscoverySourcePurpose.isValid(purpose)) { "Choose a supported source purpose." }
+            if (config.has("scrapeOptions")) {
+                val scrapeOptions = config.optJSONObject("scrapeOptions")
+                    ?: error("Saved website scraper settings are invalid.")
+                val options = WebNovelScrapeOptionsJson.decode(scrapeOptions.toString())
+                require(options.chapterLinkSelector.isNotBlank() && options.chapterLinkSelector.length <= 300 &&
+                    options.chapterContentSelector.isNotBlank() && options.chapterContentSelector.length <= 500 &&
+                    options.chapterTitleSelector.length <= 300 && options.removeSelector.length <= 500) {
+                    "Scraper selectors exceed the size limits."
+                }
+            }
             if (source.kind == DiscoverySourceKind.HTML) {
                 require(config.optString("htmlBookSelector").isNotBlank() &&
                     config.optString("htmlTitleSelector").isNotBlank() &&
@@ -563,6 +578,44 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
             }
             val existing = dao.discoverySourceById(source.id)
             if (existing == null) dao.insertDiscoverySource(source) else dao.updateDiscoverySource(source)
+        }
+    }
+
+    suspend fun updateDiscoveryScrapeOptions(
+        sourceId: String,
+        expectedBaseUrl: String,
+        pageUrl: String,
+        options: WebNovelScrapeOptions,
+    ): DiscoverySourceEntity = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            val source = dao.discoverySourceById(sourceId)
+                ?: error("This discovery source was removed. Reopen Discover before saving its scraper settings.")
+            require(source.baseUrl == expectedBaseUrl) {
+                "This discovery source changed. Reopen it before saving scraper settings."
+            }
+            require(source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+                "Built-in catalogs do not have website conversion settings."
+            }
+            val page = java.net.URI(pageUrl.trim())
+            require((page.scheme.equals("http", true) || page.scheme.equals("https", true)) &&
+                !page.host.isNullOrBlank() && page.userInfo == null && DiscoveryCatalogClient.sameOrigin(source.baseUrl, page.toString())) {
+                "Save these settings only for pages on the source website."
+            }
+            val normalizedOptions = options.copy(firstChapter = 1, lastChapter = null)
+            require(normalizedOptions.chapterLinkSelector.isNotBlank() && normalizedOptions.chapterLinkSelector.length <= 300 &&
+                normalizedOptions.chapterContentSelector.isNotBlank() && normalizedOptions.chapterContentSelector.length <= 500 &&
+                normalizedOptions.chapterTitleSelector.length <= 300 && normalizedOptions.removeSelector.length <= 500) {
+                "Scraper selectors must be valid non-empty values within their size limits."
+            }
+            WebNovelScrapeOptionsJson.decode(WebNovelScrapeOptionsJson.encode(normalizedOptions))
+            val currentConfig = DiscoverySourceConfigCodec.decode(source.configJson)
+            val updatedConfigJson = DiscoverySourceConfigCodec.encode(currentConfig.copy(scrapeOptions = normalizedOptions))
+            require(updatedConfigJson.toByteArray(Charsets.UTF_8).size <= 32 * 1024) {
+                "Source settings exceed the size limit."
+            }
+            source.copy(configJson = updatedConfigJson, updatedAt = System.currentTimeMillis()).also {
+                dao.updateDiscoverySource(it)
+            }
         }
     }
 

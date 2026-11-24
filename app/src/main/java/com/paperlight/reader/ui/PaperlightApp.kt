@@ -83,8 +83,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.paperlight.reader.data.BookEntity
 import com.paperlight.reader.data.BookRepository
+import com.paperlight.reader.data.DiscoverySourceEntity
 import com.paperlight.reader.data.PdfEpubMode
 import com.paperlight.reader.data.WebNovelJobState
+import com.paperlight.reader.discovery.DiscoverySourceConfigCodec
 import com.paperlight.reader.ui.reader.EpubReaderScreen
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import com.paperlight.reader.webnovel.WebNovelEpubUtility
@@ -221,6 +223,8 @@ private fun PaperlightAppContent(
     var pendingPdfTitle by rememberSaveable { mutableStateOf("") }
     var pdfConversionMode by rememberSaveable { mutableStateOf(PdfEpubMode.Text) }
     var novelUrl by remember { mutableStateOf("") }
+    var converterSourceId by remember { mutableStateOf<String?>(null) }
+    var converterSourceBaseUrl by remember { mutableStateOf<String?>(null) }
     var sampleChapterUrl by rememberSaveable { mutableStateOf("") }
     var renderNovelInBrowser by rememberSaveable { mutableStateOf(false) }
     var chapterPreview by remember { mutableStateOf<WebNovelPreview?>(null) }
@@ -232,12 +236,38 @@ private fun PaperlightAppContent(
     var chapterContentSelector by remember { mutableStateOf(".chapter-content, .chapter-body, #chapter-content, .read-content, .entry-content, article, main, #content") }
     var chapterTitleSelector by remember { mutableStateOf("h1, h2") }
     var removeSelector by remember { mutableStateOf("script, style, noscript, nav, header, footer, aside, .ads, .advertisement, .share, .comments") }
+    var requestDelayText by rememberSaveable { mutableStateOf("500") }
+    var savingScrapeSettings by remember { mutableStateOf(false) }
+    var scrapeSettingsStatus by remember { mutableStateOf<String?>(null) }
     var aiScrapeBusy by remember { mutableStateOf(false) }
     var aiScrapeError by remember { mutableStateOf<String?>(null) }
     var showScrapeOptions by remember { mutableStateOf(false) }
     var folder by remember { mutableStateOf<File?>(null) }
     var candidates by remember { mutableStateOf<List<ExternalBookFile>?>(null) }
     var checked by remember { mutableStateOf(setOf<Uri>()) }
+
+    fun applyScrapeOptions(options: WebNovelScrapeOptions) {
+        chapterLinkSelector = options.chapterLinkSelector
+        chapterContentSelector = options.chapterContentSelector
+        chapterTitleSelector = options.chapterTitleSelector
+        removeSelector = options.removeSelector
+        renderNovelInBrowser = options.renderInBrowser
+        requestDelayText = options.requestDelayMillis.toString()
+    }
+
+    fun beginManualWebsiteConversion() {
+        if (converterSourceId != null) {
+            applyScrapeOptions(WebNovelScrapeOptions())
+            firstChapter = "1"
+            lastChapter = ""
+            showScrapeOptions = false
+        }
+        converterSourceId = null
+        converterSourceBaseUrl = null
+        savingScrapeSettings = false
+        scrapeSettingsStatus = null
+        showCreateFromWeb = true
+    }
 
     val exportBackup = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         uri?.let { viewModel.backup(it, restore = false, includeApiKey = backupIncludeApiKey, password = backupPassword.takeIf { backupIncludeApiKey }) }
@@ -573,7 +603,7 @@ private fun PaperlightAppContent(
                         showFileManager(FileManagerMode.Browse)
                     }, modifier = Modifier.padding(horizontal = 12.dp))
                 NavigationDrawerItem(label = { Text("Create EPUB from website") }, selected = false,
-                    icon = { Icon(Icons.Rounded.Link, null) }, onClick = { showCreateFromWeb = true; scope.launch { drawer.close() } },
+                    icon = { Icon(Icons.Rounded.Link, null) }, onClick = { beginManualWebsiteConversion(); scope.launch { drawer.close() } },
                     modifier = Modifier.padding(horizontal = 12.dp))
                 NavigationDrawerItem(label = { Text("Website conversions") }, selected = false,
                     icon = { Icon(Icons.Rounded.Link, null) }, badge = { Text("${webNovelJobs.count { it.status !in setOf(WebNovelJobState.COMPLETED, WebNovelJobState.CANCELLED) }}") },
@@ -708,7 +738,7 @@ private fun PaperlightAppContent(
                             DropdownMenuItem(
                                 text = { Text("Create EPUB from website") },
                                 leadingIcon = { Icon(Icons.Rounded.Link, null) },
-                                onClick = { showMoreActions = false; showCreateFromWeb = true }
+                                onClick = { showMoreActions = false; beginManualWebsiteConversion() }
                             )
                             DropdownMenuItem(
                                 text = { Text("Scan folder") },
@@ -865,14 +895,26 @@ private fun PaperlightAppContent(
         onImportEpub = { file, title, author ->
             viewModel.importDownloadedEpub(file, title, author, activeLibraryId ?: "default")
         },
-        onConvertWebsite = { url ->
+        onConvertWebsite = { source, url ->
+            val savedOptions = DiscoverySourceConfigCodec.decode(source.configJson).scrapeOptions
+            val sameSite = sameWebOrigin(source.baseUrl, url)
+            converterSourceId = source.id
+            converterSourceBaseUrl = source.baseUrl
+            savingScrapeSettings = false
+            scrapeSettingsStatus = null
+            applyScrapeOptions(if (sameSite) savedOptions else WebNovelScrapeOptions())
             showBookDiscovery = false
             novelUrl = url
             sampleChapterUrl = ""
+            firstChapter = "1"
+            lastChapter = ""
             chapterPreview = null
             previewError = null
+            aiScrapeError = null
+            showScrapeOptions = true
             showCreateFromWeb = true
         },
+        onRequestGroqKey = { showGroqApiKeyScreen = true },
     )
     if (pagerState.settledPage == 0) pendingPdfPath?.let { path ->
         AlertDialog(
@@ -1196,6 +1238,8 @@ private fun PaperlightAppContent(
         val first = firstChapter.toIntOrNull()
         val last = lastChapter.toIntOrNull()
         val validRange = first != null && first > 0 && (lastChapter.isBlank() || (last != null && last >= first))
+        val delay = requestDelayText.toLongOrNull()
+        val validDelay = delay != null && delay in 0L..10_000L
         val options = WebNovelScrapeOptions(
             firstChapter = first ?: 1,
             lastChapter = last,
@@ -1204,8 +1248,28 @@ private fun PaperlightAppContent(
             chapterTitleSelector = chapterTitleSelector,
             removeSelector = removeSelector,
             renderInBrowser = renderNovelInBrowser,
+            requestDelayMillis = delay?.takeIf { validDelay } ?: 500L,
         )
-        val canCheckSite = !previewBusy && !aiScrapeBusy && novelUrl.startsWith("http", ignoreCase = true)
+        val canCheckSite = !previewBusy && !aiScrapeBusy && validDelay && novelUrl.startsWith("http", ignoreCase = true)
+        val canSaveScrapeSettings = converterSourceId != null && converterSourceBaseUrl != null &&
+            sameWebOrigin(converterSourceBaseUrl.orEmpty(), novelUrl) && validDelay
+
+        fun saveScrapeSettings() {
+            val sourceId = converterSourceId ?: return
+            val sourceBaseUrl = converterSourceBaseUrl ?: return
+            val pageUrl = novelUrl
+            if (!sameWebOrigin(sourceBaseUrl, pageUrl) || !validDelay) return
+            savingScrapeSettings = true
+            scrapeSettingsStatus = null
+            viewModel.saveDiscoveryScrapeOptions(
+                sourceId, sourceBaseUrl, pageUrl, options.copy(firstChapter = 1, lastChapter = null)
+            ) { saved ->
+                if (converterSourceId == sourceId && converterSourceBaseUrl == sourceBaseUrl && novelUrl == pageUrl) {
+                    savingScrapeSettings = false
+                    scrapeSettingsStatus = if (saved) "Saved settings for this website." else "Could not save settings for this website."
+                }
+            }
+        }
         AlertDialog(
             onDismissRequest = { if (!previewBusy && !aiScrapeBusy) showCreateFromWeb = false },
             title = { Text("Create EPUB from website") },
@@ -1218,8 +1282,10 @@ private fun PaperlightAppContent(
                         value = novelUrl,
                         onValueChange = {
                             novelUrl = it
+                            savingScrapeSettings = false
                             chapterPreview = null
                             previewError = null
+                            scrapeSettingsStatus = null
                         },
                         enabled = !previewBusy && !aiScrapeBusy,
                         label = { Text("Table of contents URL") },
@@ -1243,6 +1309,7 @@ private fun PaperlightAppContent(
                                 renderNovelInBrowser = it
                                 chapterPreview = null
                                 previewError = null
+                                scrapeSettingsStatus = null
                             },
                             enabled = !previewBusy && !aiScrapeBusy,
                         )
@@ -1316,6 +1383,7 @@ private fun PaperlightAppContent(
                                 chapterLinkSelector = it
                                 chapterPreview = null
                                 previewError = null
+                                scrapeSettingsStatus = null
                             },
                             enabled = !previewBusy && !aiScrapeBusy,
                             label = { Text("Chapter link CSS selector") },
@@ -1327,6 +1395,7 @@ private fun PaperlightAppContent(
                                 chapterContentSelector = it
                                 chapterPreview = null
                                 previewError = null
+                                scrapeSettingsStatus = null
                             },
                             enabled = !previewBusy && !aiScrapeBusy,
                             label = { Text("Chapter content CSS selector") },
@@ -1338,6 +1407,7 @@ private fun PaperlightAppContent(
                                 chapterTitleSelector = it
                                 chapterPreview = null
                                 previewError = null
+                                scrapeSettingsStatus = null
                             },
                             enabled = !previewBusy && !aiScrapeBusy,
                             label = { Text("Chapter title CSS selector") },
@@ -1349,11 +1419,29 @@ private fun PaperlightAppContent(
                                 removeSelector = it
                                 chapterPreview = null
                                 previewError = null
+                                scrapeSettingsStatus = null
                             },
                             enabled = !previewBusy && !aiScrapeBusy,
                             label = { Text("Remove from chapter CSS selector") },
                             supportingText = { Text("Navigation, advertisements, comments, etc.") }
                         )
+                        OutlinedTextField(
+                            value = requestDelayText,
+                            onValueChange = {
+                                requestDelayText = it.filter { char -> char in '0'..'9' }.take(5)
+                                chapterPreview = null
+                                previewError = null
+                                scrapeSettingsStatus = null
+                            },
+                            enabled = !previewBusy && !aiScrapeBusy,
+                            label = { Text("Request delay (milliseconds)") },
+                            supportingText = { Text("0 to 10,000 ms between chapters") },
+                            isError = !validDelay,
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        )
+                        if (!validDelay) Text("Enter a delay from 0 to 10,000 milliseconds.",
+                            color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                         TextButton(
                             enabled = canCheckSite,
                             onClick = {
@@ -1371,6 +1459,7 @@ private fun PaperlightAppContent(
                                         chapterContentSelector = suggestion.chapterContentSelector
                                         chapterTitleSelector = suggestion.chapterTitleSelector
                                         removeSelector = suggestion.removeSelector
+                                        scrapeSettingsStatus = null
                                     } catch (cancelled: CancellationException) {
                                         throw cancelled
                                     } catch (failure: Exception) {
@@ -1388,21 +1477,39 @@ private fun PaperlightAppContent(
                         }
                         Text("A sanitized sample from the table of contents and one chapter is sent to Groq. Review the selectors before downloading.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Groq suggestions remain editable. Preview the chapter before creating the EPUB.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         aiScrapeError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                     }
+                    if (converterSourceId != null && converterSourceBaseUrl != null &&
+                        !sameWebOrigin(converterSourceBaseUrl.orEmpty(), novelUrl)) {
+                        Text("This URL is on a different website. Saved settings for the selected source will not be changed.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    scrapeSettingsStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     Text("Chapter pages are downloaded one at a time. Some sites may block automated access or need custom selectors.",
                         style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
-                TextButton(enabled = canCheckSite && validRange, onClick = {
-                    viewModel.createEpubFromUrl(
-                        novelUrl,
-                        options,
-                        activeLibraryId ?: "default"
-                    )
-                    showCreateFromWeb = false
-                }) { Text("Download and create") }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (canSaveScrapeSettings) {
+                        TextButton(enabled = !savingScrapeSettings && !previewBusy && !aiScrapeBusy,
+                            onClick = ::saveScrapeSettings) {
+                            Text(if (savingScrapeSettings) "Saving…" else "Save for this website")
+                        }
+                    }
+                    TextButton(enabled = canCheckSite && validRange, onClick = {
+                        if (canSaveScrapeSettings) saveScrapeSettings()
+                        viewModel.createEpubFromUrl(
+                            novelUrl,
+                            options,
+                            activeLibraryId ?: "default"
+                        )
+                        showCreateFromWeb = false
+                    }) { Text("Download and create") }
+                }
             },
             dismissButton = { TextButton(enabled = !previewBusy && !aiScrapeBusy, onClick = { showCreateFromWeb = false }) { Text("Cancel") } }
         )
@@ -1458,8 +1565,10 @@ private fun BookTile(
     onOpen: () -> Unit,
     onToggleSelection: () -> Unit
 ) {
-    val cover by produceState<android.graphics.Bitmap?>(null, book.id) {
-        value = withContext(Dispatchers.IO) { BookArtwork.load(book) }
+    val cover by key(book.id) {
+        produceState<android.graphics.Bitmap?>(BookArtwork.peek(book.id), book.id) {
+            if (value == null) value = withContext(Dispatchers.IO) { BookArtwork.load(book) }
+        }
     }
     val covers = listOf(0xFF344B53, 0xFF526048, 0xFF794942, 0xFF695474, 0xFF4F586E)
     Column {
@@ -1529,8 +1638,10 @@ private fun ShelfRow(
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun BookListRow(book: BookEntity, recent: Boolean, selected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
-    val cover by produceState<android.graphics.Bitmap?>(null, book.id) {
-        value = withContext(Dispatchers.IO) { BookArtwork.load(book) }
+    val cover by key(book.id) {
+        produceState<android.graphics.Bitmap?>(BookArtwork.peek(book.id), book.id) {
+            if (value == null) value = withContext(Dispatchers.IO) { BookArtwork.load(book) }
+        }
     }
     ListItem(
         headlineContent = { Text(book.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
@@ -1561,4 +1672,15 @@ private fun bookMimeType(format: String): String = when (format.uppercase()) {
     "CBZ" -> "application/vnd.comicbook+zip"
     "CBR" -> "application/vnd.comicbook-rar"
     else -> "application/octet-stream"
+}
+
+private fun sameWebOrigin(firstUrl: String, secondUrl: String): Boolean {
+    val first = Uri.parse(firstUrl)
+    val second = Uri.parse(secondUrl)
+    val firstScheme = first.scheme?.lowercase()
+    val secondScheme = second.scheme?.lowercase()
+    if (firstScheme !in setOf("http", "https") || secondScheme !in setOf("http", "https") || firstScheme != secondScheme ||
+        first.userInfo != null || second.userInfo != null || first.host.isNullOrBlank() || second.host.isNullOrBlank()) return false
+    fun port(uri: Uri, scheme: String): Int = uri.port.takeIf { it >= 0 } ?: if (scheme == "https") 443 else 80
+    return first.host.equals(second.host, ignoreCase = true) && port(first, firstScheme!!) == port(second, secondScheme!!)
 }

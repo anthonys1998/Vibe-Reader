@@ -5,6 +5,8 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import com.paperlight.reader.data.ReaderAnnotation
+import com.paperlight.reader.discovery.DiscoveryCatalogClient
+import com.paperlight.reader.discovery.DiscoverySourceConfig
 import com.paperlight.reader.webnovel.WebNovelEpubUtility
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import kotlinx.coroutines.Dispatchers
@@ -109,6 +111,18 @@ data class GroqScrapeSuggestion(
 
 class GroqAiClient(private val context: Context) {
     private val keyStore = GroqApiKeyStore(context)
+
+    suspend fun suggestDiscoveryConfig(
+        url: String,
+        currentConfig: DiscoverySourceConfig,
+        renderedContext: Context? = null,
+    ): DiscoverySourceConfig = withContext(Dispatchers.IO) {
+        val sample = DiscoveryCatalogClient.htmlSampleForAi(url, currentConfig.renderJavaScript, renderedContext)
+        val prompt = """Configure CSS selectors for the repeated book cards in this public HTML catalog. Return ONLY a JSON object with string fields htmlBookSelector, htmlTitleSelector, htmlAuthorSelector, htmlDetailLinkSelector, htmlCoverSelector, and htmlEpubLinkSelector. htmlBookSelector, htmlTitleSelector, and htmlDetailLinkSelector are required. The other selectors may be empty if absent. Use CSS selectors only, and make title/author/details/cover/download selectors relative to the book card. Do not return JavaScript, URLs to fetch, or explanations.
+HTML SAMPLE:
+${sample.html}"""
+        applyDiscoveryConfigSuggestion(parseJson(request(prompt)), sample.finalUrl, sample.html, currentConfig)
+    }
 
     suspend fun suggestScrapeConfiguration(
         url: String,
@@ -236,6 +250,7 @@ ${samples.chapterHtml}"""
     }
 
     private fun parseJson(raw: String): JSONObject {
+        require(raw.length <= MAX_SELECTOR_RESPONSE_CHARS) { "Groq's selector response exceeds the size limit." }
         val cleaned = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
         val start = cleaned.indexOf('{')
         val end = cleaned.lastIndexOf('}')
@@ -246,5 +261,29 @@ ${samples.chapterHtml}"""
     private companion object {
         const val MAX_NOTES_CHARS = 24_000
         const val MAX_SUMMARY_CHARS = 10_000
+        const val MAX_SELECTOR_RESPONSE_CHARS = 32_000
     }
+}
+
+internal fun applyDiscoveryConfigSuggestion(
+    json: JSONObject,
+    finalUrl: String,
+    sampleHtml: String,
+    currentConfig: DiscoverySourceConfig,
+): DiscoverySourceConfig {
+    fun selector(field: String, fallback: String = ""): String {
+        val value = json.optString(field, fallback).trim()
+        require(value.length <= 1_000) { "The suggested $field selector exceeds the size limit." }
+        return value
+    }
+    val candidate = currentConfig.copy(
+        htmlBookSelector = selector("htmlBookSelector"),
+        htmlTitleSelector = selector("htmlTitleSelector"),
+        htmlAuthorSelector = selector("htmlAuthorSelector", currentConfig.htmlAuthorSelector),
+        htmlDetailLinkSelector = selector("htmlDetailLinkSelector"),
+        htmlCoverSelector = selector("htmlCoverSelector", currentConfig.htmlCoverSelector),
+        htmlEpubLinkSelector = selector("htmlEpubLinkSelector", currentConfig.htmlEpubLinkSelector),
+    )
+    DiscoveryCatalogClient.validateAiDiscoveryConfig(finalUrl, sampleHtml, candidate)
+    return candidate
 }

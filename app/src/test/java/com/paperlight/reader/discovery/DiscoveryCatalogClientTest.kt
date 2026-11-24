@@ -1,9 +1,15 @@
 package com.paperlight.reader.discovery
 
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.ServerSocket
+import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -294,6 +300,62 @@ class DiscoveryCatalogClientTest {
             } catch (_: IllegalArgumentException) {
             }
         } finally {
+            file.delete()
+        }
+    }
+
+    @Test fun standardEbooksDownloadUrlSelectsTheDirectFileResponseAndPreservesOtherQueryData() {
+        assertEquals(
+            "https://standardebooks.org/ebooks/example/book/downloads/book.epub?lang=en&tag=first&tag=second&source=download#contents",
+            DiscoveryCatalogClient.standardEpubDownloadUrl(
+                "https://standardebooks.org/ebooks/example/book/downloads/book.epub?lang=en&source=preview&tag=first&source=old&tag=second#contents"))
+        assertEquals(
+            "https://standardebooks.org/ebooks/example/book/downloads/book.epub?source=download",
+            DiscoveryCatalogClient.standardEpubDownloadUrl(
+                "https://standardebooks.org/ebooks/example/book/downloads/book.epub"))
+    }
+
+    @Test fun epubStreamingAcceptsBinaryZipBytesFromAnHttpResponse() {
+        val payload = ByteArrayOutputStream().use { bytes ->
+            ZipOutputStream(bytes).use { zip ->
+                zip.putNextEntry(ZipEntry("mimetype"))
+                zip.write("application/epub+zip".toByteArray(StandardCharsets.US_ASCII))
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("META-INF/container.xml"))
+                zip.write("<container/>".toByteArray(StandardCharsets.UTF_8))
+                zip.closeEntry()
+            }
+            bytes.toByteArray()
+        }
+        val server = ServerSocket(0)
+        val serverFailure = AtomicReference<Throwable?>()
+        val serverThread = Thread {
+            try {
+                server.accept().use { socket ->
+                    val output = socket.getOutputStream()
+                    output.write(("HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: application/epub+zip\r\n" +
+                        "Content-Length: ${payload.size}\r\n" +
+                        "Connection: close\r\n\r\n").toByteArray(StandardCharsets.US_ASCII))
+                    output.write(payload)
+                    output.flush()
+                }
+            } catch (failure: Throwable) {
+                serverFailure.set(failure)
+            }
+        }.apply { isDaemon = true; start() }
+        val file = File(RuntimeEnvironment.getApplication().cacheDir, "downloaded-epub-" + UUID.randomUUID() + ".epub")
+        try {
+            runBlocking {
+                DiscoveryCatalogClient.streamEpub("http://127.0.0.1:${server.localPort}/book.epub", file)
+            }
+            serverThread.join(5_000)
+            assertFalse(serverThread.isAlive)
+            assertNull(serverFailure.get())
+            assertArrayEquals(payload, file.readBytes())
+        } finally {
+            server.close()
+            serverThread.join(5_000)
             file.delete()
         }
     }

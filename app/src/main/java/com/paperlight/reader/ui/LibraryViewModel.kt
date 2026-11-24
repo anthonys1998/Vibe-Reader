@@ -101,6 +101,28 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
         }
     }
 
+    fun saveDiscoveryScrapeOptions(
+        id: String,
+        expectedBaseUrl: String,
+        pageUrl: String,
+        options: WebNovelScrapeOptions,
+        onComplete: (Boolean) -> Unit = {},
+    ) {
+        if (!recoveryAllowsLibraryAction()) { onComplete(false); return }
+        viewModelScope.launch {
+            try {
+                repository.updateDiscoveryScrapeOptions(id, expectedBaseUrl, pageUrl, options)
+                _message.value = "Saved scraper settings for this website."
+                onComplete(true)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not save scraper settings for this website."
+                onComplete(false)
+            }
+        }
+    }
+
     fun setDiscoverySourceEnabled(id: String, enabled: Boolean, onComplete: (Boolean) -> Unit = {}) {
         if (!recoveryAllowsLibraryAction()) { onComplete(false); return }
         viewModelScope.launch {

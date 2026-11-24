@@ -3,6 +3,7 @@ package com.paperlight.reader.ui
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.LruCache
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -39,6 +40,8 @@ import androidx.compose.ui.window.DialogProperties
 import com.paperlight.reader.data.DiscoverySourceEntity
 import com.paperlight.reader.data.DiscoverySourceIds
 import com.paperlight.reader.data.DiscoverySourceKind
+import com.paperlight.reader.ai.GroqAiClient
+import com.paperlight.reader.ai.GroqApiKeyStore
 import com.paperlight.reader.discovery.DiscoveryBook
 import com.paperlight.reader.discovery.DiscoveryCatalogCache
 import com.paperlight.reader.discovery.DiscoveryCatalogClient
@@ -46,6 +49,7 @@ import com.paperlight.reader.discovery.DiscoveryLink
 import com.paperlight.reader.discovery.DiscoveryPage
 import com.paperlight.reader.discovery.DiscoverySourceConfig
 import com.paperlight.reader.discovery.DiscoverySourceConfigCodec
+import com.paperlight.reader.discovery.DiscoverySourcePurpose
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -65,7 +69,8 @@ internal fun BookDiscoveryScreen(
     viewModel: LibraryViewModel,
     onDismiss: () -> Unit,
     onImportEpub: (File, String, String) -> Unit,
-    onConvertWebsite: (String) -> Unit,
+    onConvertWebsite: (DiscoverySourceEntity, String) -> Unit,
+    onRequestGroqKey: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -94,6 +99,7 @@ internal fun BookDiscoveryScreen(
     var editorPreviewTitles by remember { mutableStateOf<List<String>>(emptyList()) }
     var editorDetected by remember { mutableStateOf(false) }
     var detecting by remember { mutableStateOf(false) }
+    var suggestingSelectors by remember { mutableStateOf(false) }
     var editorError by remember { mutableStateOf<String?>(null) }
     var sourceActionError by remember { mutableStateOf<String?>(null) }
     var deleteSource by remember { mutableStateOf<DiscoverySourceEntity?>(null) }
@@ -144,6 +150,7 @@ internal fun BookDiscoveryScreen(
         editorPreviewTitles = previewTitles.take(4)
         editorDetected = source != null
         editorError = null
+        suggestingSelectors = false
         editorVisible = true
     }
 
@@ -230,6 +237,15 @@ internal fun BookDiscoveryScreen(
 
     fun downloadBook(source: DiscoverySourceEntity?, book: DiscoveryBook) {
         if (source == null || downloadingId != null) return
+        if (DiscoverySourceConfigCodec.decode(source.configJson).purpose == DiscoverySourcePurpose.CONVERT_WEBSITE) {
+            if (book.epubUrl != null && book.detailsUrl == book.epubUrl) {
+                error = "This entry only provides an EPUB download. Choose Ebook catalog to download it, or use the book’s website page in the converter."
+                return
+            }
+            onConvertWebsite(source, book.detailsUrl)
+            onDismiss()
+            return
+        }
         downloadingId = book.id
         error = null
         scope.launch {
@@ -430,12 +446,12 @@ internal fun BookDiscoveryScreen(
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (selectedSource?.kind == DiscoverySourceKind.HTML) {
-                        Text("This listing uses saved CSS selectors. If results are missing, edit them or review the page in Website to EPUB; sign-in sites are unsupported.",
+                        Text("This listing uses saved CSS selectors. If results are missing, edit or suggest selectors; sign-in sites are unsupported.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         page?.detectedConfig?.let { suggestion ->
                             TextButton(enabled = downloadingId == null, onClick = {
                                 beginEdit(selectedSource, suggestion, page?.books.orEmpty().take(4).map { it.title })
-                            }) { Text("Review detected selectors") }
+                            }) { Text("Edit detected selectors") }
                         }
                     }
                     sourceActionError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
@@ -470,10 +486,6 @@ internal fun BookDiscoveryScreen(
                                     leadingContent = { DiscoveryCover(book.coverUrl, book.title) },
                                     trailingContent = {
                                         Column(horizontalAlignment = Alignment.End) {
-                                            if (selectedSource?.kind == DiscoverySourceKind.HTML) {
-                                                TextButton(enabled = downloadingId == null,
-                                                    onClick = { onConvertWebsite(book.detailsUrl) }) { Text("Review") }
-                                            }
                                             TextButton(enabled = downloadingId == null,
                                                 onClick = { downloadBook(selectedSource, book) }) {
                                                 Text(if (downloadingId == book.id) "Downloading…" else "Add")
@@ -512,6 +524,28 @@ internal fun BookDiscoveryScreen(
                         editorDetected = false
                         editorPreviewTitles = emptyList()
                     }, enabled = !detecting, label = { Text("Source URL") }, singleLine = true)
+                    Text("Add action", style = MaterialTheme.typography.titleSmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = editorConfig.purpose == DiscoverySourcePurpose.DOWNLOAD_EPUB,
+                            enabled = !detecting,
+                            onClick = { updateEditorConfig { it.copy(purpose = DiscoverySourcePurpose.DOWNLOAD_EPUB) } },
+                            label = { Text("Ebook catalog") },
+                        )
+                        FilterChip(
+                            selected = editorConfig.purpose == DiscoverySourcePurpose.CONVERT_WEBSITE,
+                            enabled = !detecting,
+                            onClick = { updateEditorConfig { it.copy(purpose = DiscoverySourcePurpose.CONVERT_WEBSITE) } },
+                            label = { Text("Scraper / converter") },
+                        )
+                    }
+                    Text(
+                        if (editorConfig.purpose == DiscoverySourcePurpose.CONVERT_WEBSITE)
+                            "Add opens Website to EPUB for the selected book."
+                        else "Add downloads an EPUB from the selected book page.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     if (editorKind == DiscoverySourceKind.HTML) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(checked = editorConfig.renderJavaScript, enabled = !detecting, onCheckedChange = { enabled ->
@@ -535,8 +569,10 @@ internal fun BookDiscoveryScreen(
                                     editorKind = detected.kind
                                     editorUrl = detected.baseUrl
                                     if (editorName.isBlank()) editorName = detected.suggestedName
-                                    editorConfig = detected.config.copy(renderJavaScript =
-                                        detected.kind == DiscoverySourceKind.HTML && editorConfig.renderJavaScript)
+                                    editorConfig = detected.config.copy(
+                                        renderJavaScript = detected.kind == DiscoverySourceKind.HTML && editorConfig.renderJavaScript,
+                                        purpose = editorConfig.purpose,
+                                        scrapeOptions = editorConfig.scrapeOptions)
                                     editorPreviewTitles = detected.previewTitles
                                     editorDetected = true
                                     editorError = "Detected " + sourceKindLabel(detected.kind) + ". Review settings before saving."
@@ -550,10 +586,53 @@ internal fun BookDiscoveryScreen(
                             }
                         }
                     }) { Text(if (detecting) "Checking…" else "Detect source") }
-                    if (editorDetected && editorKind == DiscoverySourceKind.HTML) {
-                        TextButton(enabled = !detecting, onClick = ::previewEditorListing) {
-                            Text(if (detecting) "Previewing…" else "Preview listing")
+                    if (editorKind == DiscoverySourceKind.HTML && editorUrl.isNotBlank()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (editorDetected) TextButton(enabled = !detecting, onClick = ::previewEditorListing) {
+                                Text(if (detecting && !suggestingSelectors) "Previewing…" else "Preview listing")
+                            }
+                            TextButton(enabled = !detecting && editorUrl.isNotBlank(), onClick = {
+                                if (!GroqApiKeyStore(context).hasKey()) {
+                                    onRequestGroqKey()
+                                } else {
+                                    detecting = true
+                                    suggestingSelectors = true
+                                    editorError = null
+                                    editorPreviewTitles = emptyList()
+                                    val currentConfig = editorConfig
+                                    scope.launch {
+                                        try {
+                                            val suggestion = withContext(Dispatchers.IO) {
+                                                GroqAiClient(context).suggestDiscoveryConfig(
+                                                    editorUrl.trim(), currentConfig,
+                                                    if (currentConfig.renderJavaScript) context.applicationContext else null)
+                                            }
+                                            editorConfig = currentConfig.copy(
+                                                htmlBookSelector = suggestion.htmlBookSelector,
+                                                htmlTitleSelector = suggestion.htmlTitleSelector,
+                                                htmlAuthorSelector = suggestion.htmlAuthorSelector,
+                                                htmlDetailLinkSelector = suggestion.htmlDetailLinkSelector,
+                                                htmlCoverSelector = suggestion.htmlCoverSelector,
+                                                htmlEpubLinkSelector = suggestion.htmlEpubLinkSelector,
+                                            )
+                                            editorKind = DiscoverySourceKind.HTML
+                                            editorDetected = true
+                                        } catch (cancelled: CancellationException) {
+                                            throw cancelled
+                                        } catch (failure: Exception) {
+                                            editorError = failure.message ?: "Could not suggest listing selectors."
+                                        } finally {
+                                            suggestingSelectors = false
+                                            detecting = false
+                                        }
+                                    }
+                                }
+                            }) {
+                                Text(if (suggestingSelectors) "Suggesting…" else "Suggest selectors with Groq")
+                            }
                         }
+                        Text("A bounded, sanitized sample of this public listing is sent to Groq using your configured key and model.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (editorPreviewTitles.isNotEmpty()) {
                         Text("Preview: " + editorPreviewTitles.joinToString(" · "),
@@ -597,10 +676,6 @@ internal fun BookDiscoveryScreen(
                             OutlinedTextField(value = editorConfig.htmlEpubLinkSelector,
                                 onValueChange = { value -> updateEditorConfig { it.copy(htmlEpubLinkSelector = value.take(1000)) } },
                                 enabled = !detecting, label = { Text("Direct EPUB link selector (optional)") })
-                            TextButton(onClick = {
-                                editorVisible = false
-                                onConvertWebsite(editorUrl)
-                            }) { Text("Review this website in the EPUB converter") }
                         }
                     }
                     editorError?.let { Text(it, color = MaterialTheme.colorScheme.error,
@@ -665,15 +740,27 @@ internal fun BookDiscoveryScreen(
 
 @Composable
 private fun DiscoveryCover(url: String?, title: String) {
-    val bitmap by produceState<Bitmap?>(null, url) {
-        value = null
-        if (!url.isNullOrBlank()) value = loadDiscoveryCover(url)
+    val bitmap by key(url) {
+        produceState<Bitmap?>(DiscoveryCoverMemoryCache.get(url), url) {
+            if (value == null && !url.isNullOrBlank()) {
+                value = loadDiscoveryCover(url)?.also { DiscoveryCoverMemoryCache.put(url, it) }
+            }
+        }
     }
     Box(Modifier.size(width = 42.dp, height = 62.dp).clip(RoundedCornerShape(3.dp)),
         contentAlignment = Alignment.Center) {
         if (bitmap != null) Image(bitmap!!.asImageBitmap(), title, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         else Icon(Icons.Rounded.Book, contentDescription = null)
     }
+}
+
+private object DiscoveryCoverMemoryCache {
+    private val cache = object : LruCache<String, Bitmap>(4 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    fun get(url: String?): Bitmap? = url?.let(cache::get)
+    fun put(url: String, bitmap: Bitmap) { cache.put(url, bitmap) }
 }
 
 private suspend fun loadDiscoveryCover(rawUrl: String): Bitmap? = withContext(Dispatchers.IO) {

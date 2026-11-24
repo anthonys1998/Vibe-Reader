@@ -14,6 +14,8 @@ internal object BookArtwork {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
     }
 
+    fun peek(bookId: String): Bitmap? = cache.get(bookId)
+
     fun load(book: BookEntity): Bitmap? {
         cache.get(book.id)?.let { return it }
         val image = runCatching {
