@@ -2,7 +2,7 @@
 
 Statuses: **Complete** means implemented and checked; **Partial** means the existing feature covers some of the request or an external compatibility check remains; **Pending** means work remains. Backup/restore redesign is excluded. Extending its existing format to preserve new durable job/source data is included as a compatibility task.
 
-**CI validation (2026-11-24):** [GitHub Actions run 45302865490](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45302865490) succeeded on commit 864095fd36603570b689d771342f5436104866d0. Workflow execution, unit tests, and debug APK assembly passed. That run used the earlier workflow, which did not upload the debug APK when signing credentials were absent. The debug-fallback and configurable-signer workflow changes below still need a new CI run. Java and Gradle remain unavailable locally; device verification and the secrets-gated signed build are pending.
+**CI validation (2026-11-24):** [GitHub Actions run 45306202634](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45306202634) succeeded on commit 85d6e59dfcbc063cd80eca5796514103f9986fcb. Unit tests and debug APK assembly passed, and the updated workflow uploaded [Paperlight-debug artifact 14880753430](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45306202634/artifacts/14880753430) (51,632,502 bytes; SHA-256 `b9e6c0382ae9105997c17ee3b33f4312646dc26e6689f04d2fec8e0ffbfd5f9e`). Earlier run 45302865490 used the previous workflow and produced no APK artifact. Java and Gradle remain unavailable locally; signed-release and device verification are pending.
 
 ## 1. APK update continuity and release hardening — Partial
 
@@ -10,7 +10,7 @@ Statuses: **Complete** means implemented and checked; **Partial** means the exis
 
 **Changes in Phase 1:** Pushes and pull requests test and assemble debug. The workflow uploads a clearly named Paperlight-debug artifact when no signed build is produced; it retains the same application ID and may use a per-run debug key, so it may not update an installation signed with another key. On trusted direct pushes or an explicit signed-release dispatch from a trusted branch, a signed APK is uploaded only after package, version, and signer checks against ANDROID_EXPECTED_CERT_SHA256. Missing signing values on an ordinary push result in the debug artifact; an explicit signed-release request fails clearly if values are missing or the expected fingerprint is malformed. A key whose actual signer differs from the configured fingerprint fails closed. Manual releases require a version code greater than 106 and any installed version intended to be updated. The temporary keystore is removed by a shell trap. No key is generated or rotated, and secrets are not changed.
 
-**Still unverified:** The run #66 signer certificate was extracted; the downloaded artifact ZIP matched GitHub's recorded artifact digest. The APK signature was not independently validated. The old artifact does not contain its private key, and continuity with it is no longer required. The newly configured expected signer, stable keystore availability, debug artifact upload, signed artifact production, and all on-device install/update behavior remain unverified.
+**Still unverified:** The run #66 signer certificate was extracted; the downloaded artifact ZIP matched GitHub's recorded artifact digest. The APK signature was not independently validated. The old artifact does not contain its private key, and continuity with it is no longer required. Stable keystore availability, signed artifact production, and all on-device install/update behavior remain unverified. The new debug artifact upload passed in run 45306202634.
 
 **Checklist:**
 - [x] Inspect the latest available Actions APK artifact identity and record its package, version code, and signer fingerprint.
@@ -18,12 +18,13 @@ Statuses: **Complete** means implemented and checked; **Partial** means the exis
 - [x] Require signed APKs to match the configured expected certificate and use a version code above 106; remove caller-supplied signer/baseline overrides.
 - [x] Make an explicit manual signed-release request fail clearly when signing credentials or a valid expected certificate are missing.
 - [x] Check `git diff --check`, shell syntax for release scripts, embedded Python syntax, and validator accept/reject behavior.
-- [x] Run CI unit tests and debug build; the workflow parsed and executed in run 45302865490.
+- [x] Run CI unit tests and debug build; the workflow passed in run 45306202634.
 - [x] Add a Paperlight-debug artifact fallback when a signed build is not produced; verify the step conditions and failure behavior statically.
+- [x] Confirm the debug artifact was uploaded: [run 45306202634, artifact 14880753430](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45306202634/artifacts/14880753430).
 - [ ] Run the signed-release path with configured credentials and verify package, version, and signer.
 - [ ] Verify APK installation/update behavior on devices; a debug APK with a different key may require uninstalling the existing app.
 
-**Status:** Partial: prior CI tests and debug assembly passed. The new debug-artifact fallback and explicit release failure path are implemented and statically checked; a new Actions artifact, configured-signer release, and device installation have not yet been verified.
+**Status:** Partial: CI tests, debug assembly, and the `Paperlight-debug` artifact upload passed in run 45306202634. Configured-signer release production and device installation remain unverified.
 
 ## 2. Durable website-to-EPUB conversion engine — Partial
 
@@ -108,8 +109,7 @@ The notes screen already allows editing and saving a generated summary locally. 
 
 ## Verification checklist
 
-- [x] CI run 45302865490 parsed and executed the earlier workflow; unit tests and debug build passed. That workflow did not upload the debug APK when signing credentials were missing.
-- [ ] Validate the updated workflow and download the debug or signed APK artifact from a new Actions run.
+- [x] CI run 45306202634 passed unit tests and debug assembly and uploaded [Paperlight-debug artifact 14880753430](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45306202634/artifacts/14880753430).
 - [ ] Run the signed release path with configured credentials; validate package/version/signer and verify installation behavior on device.
 - [x] Phases 2–3: add tests for exclusive claims, stale-token progress/finalization, process-death pause reconciliation, v4→v8 migrations, shared Worker/foreground leases, pause/cancel intent, cooldown persistence, Work scheduling and cached Worker import, changed-TOC manifest reuse, redirect origin validation, corrupt-manifest reset, cache preservation, and backup round-trip/legacy/path/hash/collision/rollback behavior (backup tests passed in CI run 45302865490).
 - [ ] Verify numeric/date 429 cooldowns, atomic checkpoint retry, cancel/retry, service process-death recovery, duplicate prevention/idempotent import, and backup/restore job/source compatibility on Android devices.
