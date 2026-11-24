@@ -122,7 +122,7 @@ The notes screen already allows editing and saving a generated summary locally. 
 - [x] Standard Ebooks downloads use the `?source=download` response instead of its HTML interstitial; a live download was verified as an EPUB file.
 - [x] Custom source purpose is independent of HTML/OPDS transport and defaults legacy sources to direct EPUB download. Add follows the saved purpose; Groq can suggest HTML listing selectors, and converter scraper settings are saved per website.
 - [x] Cache discovery cover thumbnails and local book artwork in bounded memory; library rows can use cached local artwork.
-- [ ] Run follow-up CI unit tests/debug build and verify APK artifact.
+- [x] Unit tests and debug build passed, and `Paperlight-debug` was uploaded in [Actions run 45333320154](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45333320154).
 - [ ] Verify purpose-based Add routing, saved converter profiles, and cover display on an Android device.
 
-**Status:** Partial: implementation and live Standard Ebooks download verification are complete; follow-up CI and device checks remain.
+**Status:** Partial: implementation, live Standard Ebooks file download verification, and follow-up CI are complete. Device checks remain.
