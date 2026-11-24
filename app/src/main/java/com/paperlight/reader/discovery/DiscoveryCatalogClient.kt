@@ -692,7 +692,7 @@ object DiscoveryCatalogClient {
         val action = safeResolve(baseUrl, form.attr("action").ifBlank { baseUrl }) ?: return null
         val encodedName = java.net.URLEncoder.encode(inputName, Charsets.UTF_8.name())
         val separator = if (action.contains("?")) "&" else "?"
-        "$action$separator$encodedName={searchTerms}"
+        return "$action$separator$encodedName={searchTerms}"
     }
 
     private data class FetchedDocument(val document: Document, val finalUrl: String, val contentType: String)

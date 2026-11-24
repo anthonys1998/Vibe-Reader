@@ -570,7 +570,10 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                 if (journalWritten) {
                     recoveryRequired = runCatching {
                         val journalFile = restoreJournalFile()
-                        val ids = JSONObject(journalFile.inputStream().use { readUtf8Bounded(it, MaxJournalBytes) }).getJSONArray("bookIds")
+                        val rollbackJournal = JSONObject(
+                            journalFile.inputStream().use { readUtf8Bounded(it, MaxJournalBytes) },
+                        )
+                        val ids = rollbackJournal.getJSONArray("bookIds")
                         val booksDirectory = File(context.filesDir, "books")
                         repeat(ids.length()) { index ->
                             val id = ids.getString(index)
@@ -581,7 +584,7 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                                 }
                             }
                         }
-                        val ownedCheckpointFiles = journal.optJSONArray("ownedCheckpointFiles") ?: JSONArray()
+                        val ownedCheckpointFiles = rollbackJournal.optJSONArray("ownedCheckpointFiles") ?: JSONArray()
                         repeat(ownedCheckpointFiles.length()) { index ->
                             val record = checkpointRecordFromJson(ownedCheckpointFiles.getJSONObject(index))
                             val file = checkpointFile(File(context.filesDir, CheckpointDirectory), record.key, record.name)
@@ -781,6 +784,7 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
             }
         } else emptyMap()
         if (journalVersion >= 3) {
+            val restoreCoroutineContext = coroutineContext
             val extensionSizeValue = journal.opt("webNovelExtensionSize")
             if (extensionSizeValue != null && extensionSizeValue != JSONObject.NULL) {
                 val extensionSize = (extensionSizeValue as? Number)?.toLong()
@@ -801,7 +805,7 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                         }.toSet()
                     }.orEmpty()
                     WebNovelBackupCodec.validatePublishedCheckpoints(payload, File(context.filesDir, CheckpointDirectory), skippedKeys) {
-                        coroutineContext.ensureActive()
+                        restoreCoroutineContext.ensureActive()
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
