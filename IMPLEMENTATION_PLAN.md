@@ -127,3 +127,5 @@ The notes screen already allows editing and saving a generated summary locally. 
 - [ ] Verify purpose-based Add routing, saved converter profiles, and cover display on an Android device.
 
 **Status:** Partial: implementation, live Standard Ebooks file download verification, and follow-up CI are complete. Device checks remain.
+
+- [x] Version 2.0 Discover navigation, Standard Ebooks storefront, NovelPing parsing, AI sampling, and book details passed the [CI build and unit tests](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45348451237). Device and live Groq checks remain pending.
