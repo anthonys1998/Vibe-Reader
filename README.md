@@ -7,15 +7,15 @@ Vibe Reader is an Android ebook library and reader. Books are imported into app-
 - Read EPUB, PDF, TXT, MOBI, AZW/AZW3, CBZ, and CBR books. DRM-protected books and KFX are not supported.
 - Organize books in named libraries; search, sort, filter, and track reading progress.
 - Use EPUB contents, bookmarks, highlights, notes, text search, text-to-speech, adjustable reading controls, and accessibility settings. PDF and comics support page navigation and zoom.
-- Discover books from Standard Ebooks, optional Project Gutenberg, and configurable OPDS or HTML sources. For custom sources, choose whether Add downloads an available EPUB or opens Website to EPUB directly.
-- Configure custom HTML listing selectors with Groq suggestions and save converter scraper settings per website. Cover thumbnails use bounded in-memory caches, and local book covers appear in library rows.
+- Discover with a cover-forward Standard Ebooks shelf, Latest/Popular/Browse controls, title/author search, and tappable synopsis/genre details. Optional Project Gutenberg and custom OPDS/HTML catalogs use the same separate Add action.
+- Choose whether a custom source's Add downloads an available EPUB or opens Website to EPUB. Configure HTML book-list selectors with editable Groq suggestions, same-site search/latest/popular URLs, and converter scraper settings saved per website. Cover thumbnails use bounded in-memory caches, and local book covers appear in library rows.
 - Queue website-to-EPUB conversions, pause/resume/cancel them, and recover from interruptions using saved chapter checkpoints. Android may delay background work.
 - Back up and restore books, reading data, settings, discovery sources, and conversion checkpoints. Export a book in its original format or share its original file. Including the Groq API key in a backup requires a password and encrypts the key.
 - Generate note summaries with Groq, then edit and save them locally. Summary generation uses the network; saved summaries can be read and edited offline. Regenerating after manual edits requires confirmation.
 
 ## Build locally
 
-Open this repository in Android Studio and allow Gradle to sync. The project uses Kotlin, Jetpack Compose, Room, and Android WebView; it is configured for Android SDK 36, JDK 17, NDK 28.2.13676358, and CMake 3.22.1. There is no Gradle wrapper in the repository, so use Android Studio's configured Gradle installation or an installed Gradle 9.1.0.
+Open this repository in Android Studio and allow Gradle to sync. The app version name is 2.0. CI continues to assign monotonically increasing version codes; local builds use the configured default. The project uses Kotlin, Jetpack Compose, Room, and Android WebView; it is configured for Android SDK 36, JDK 17, NDK 28.2.13676358, and CMake 3.22.1. There is no Gradle wrapper in the repository, so use Android Studio's configured Gradle installation or an installed Gradle 9.1.0.
 
 To run the unit tests and build a debug APK with Gradle installed:
 

@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -178,6 +179,8 @@ private fun PaperlightAppContent(
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val pagerState = rememberPagerState(pageCount = { 2 })
+    val libraryListState = rememberLazyListState()
+    val libraryShelfState = rememberLazyListState()
     var fileManagerMode by rememberSaveable { mutableStateOf(FileManagerMode.Browse) }
     var externalBook by remember { mutableStateOf<BookEntity?>(null) }
     var openingExternalFileName by remember { mutableStateOf<String?>(null) }
@@ -266,6 +269,25 @@ private fun PaperlightAppContent(
         converterSourceBaseUrl = null
         savingScrapeSettings = false
         scrapeSettingsStatus = null
+        showCreateFromWeb = true
+    }
+
+    fun beginSourceWebsiteConversion(source: DiscoverySourceEntity, url: String) {
+        val savedOptions = DiscoverySourceConfigCodec.decode(source.configJson).scrapeOptions
+        val sameSite = sameWebOrigin(source.baseUrl, url)
+        converterSourceId = source.id
+        converterSourceBaseUrl = source.baseUrl
+        savingScrapeSettings = false
+        scrapeSettingsStatus = null
+        applyScrapeOptions(if (sameSite) savedOptions else WebNovelScrapeOptions())
+        novelUrl = url
+        sampleChapterUrl = ""
+        firstChapter = "1"
+        lastChapter = ""
+        chapterPreview = null
+        previewError = null
+        aiScrapeError = null
+        showScrapeOptions = true
         showCreateFromWeb = true
     }
 
@@ -490,20 +512,21 @@ private fun PaperlightAppContent(
     val activeLibrary = libraries.find { it.id == activeLibraryId }
     val title = activeLibrary?.name ?: "All books"
     BackHandler(selectedBooks.isNotEmpty()) { selectedBooks = emptySet() }
+    BackHandler(showBookDiscovery && !showCreateFromWeb && !showGroqApiKeyScreen) { showBookDiscovery = false }
     BackHandler(pagerState.currentPage == 1 || fileManagerMode != FileManagerMode.Browse) { returnToLibrary() }
     BackHandler(showWebNovelJobs) { showWebNovelJobs = false }
     Box(Modifier.fillMaxSize()) {
     HorizontalPager(
         state = pagerState,
-        userScrollEnabled = !showWebNovelJobs && !drawer.isOpen && fileManagerMode == FileManagerMode.Browse,
+        userScrollEnabled = !showBookDiscovery && !showWebNovelJobs && !drawer.isOpen && fileManagerMode == FileManagerMode.Browse,
         beyondViewportPageCount = 1,
-        modifier = Modifier.fillMaxSize().pointerInput(drawer.isOpen, pagerState, fileManagerMode, showWebNovelJobs) {
+        modifier = Modifier.fillMaxSize().pointerInput(drawer.isOpen, pagerState, fileManagerMode, showWebNovelJobs, showBookDiscovery) {
             val touchSlop = viewConfiguration.touchSlop
             val menuSwipeDistance = 96.dp.toPx()
             val horizontalRatio = 1.5f
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                if (showWebNovelJobs || drawer.isOpen || fileManagerMode != FileManagerMode.Browse || pagerState.currentPage != 0 ||
+                if (showBookDiscovery || showWebNovelJobs || drawer.isOpen || fileManagerMode != FileManagerMode.Browse || pagerState.currentPage != 0 ||
                     pagerState.canScrollBackward || pagerState.isScrollInProgress
                 ) return@awaitEachGesture
 
@@ -572,18 +595,18 @@ private fun PaperlightAppContent(
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text("Vibe Reader", Modifier.padding(24.dp), fontFamily = FontFamily.Serif,
                     style = MaterialTheme.typography.headlineMedium)
-                NavigationDrawerItem(label = { Text("All books") }, selected = activeLibraryId == null,
+                NavigationDrawerItem(label = { Text("All books") }, selected = activeLibraryId == null && !showBookDiscovery,
                     icon = { Icon(Icons.Rounded.LibraryBooks, null) }, badge = { Text("${books.size}") },
-                    onClick = { activeLibraryId = null; selectedBooks = emptySet(); scope.launch { drawer.close() } },
+                    onClick = { activeLibraryId = null; selectedBooks = emptySet(); showBookDiscovery = false; scope.launch { drawer.close() } },
                     modifier = Modifier.padding(horizontal = 12.dp))
                 Text("Libraries", Modifier.padding(start = 28.dp, top = 24.dp, bottom = 8.dp),
                     style = MaterialTheme.typography.labelLarge)
                 libraries.forEach { library ->
                         NavigationDrawerItem(label = { Text(library.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            selected = activeLibraryId == library.id,
+                            selected = activeLibraryId == library.id && !showBookDiscovery,
                             icon = { Icon(Icons.Rounded.MenuBook, null) },
                             badge = { Text("${books.count { it.libraryId == library.id }}") },
-                            onClick = { activeLibraryId = library.id; selectedBooks = emptySet(); scope.launch { drawer.close() } },
+                            onClick = { activeLibraryId = library.id; selectedBooks = emptySet(); showBookDiscovery = false; scope.launch { drawer.close() } },
                             modifier = Modifier.padding(horizontal = 12.dp))
                 }
                 NavigationDrawerItem(label = { Text("New library") }, selected = false,
@@ -613,9 +636,9 @@ private fun PaperlightAppContent(
                     icon = { Icon(Icons.Rounded.PictureAsPdf, null) },
                     onClick = { if (conversionProgress == null) showFileManager(FileManagerMode.ConvertPdf) },
                     modifier = Modifier.padding(horizontal = 12.dp))
-                NavigationDrawerItem(label = { Text("Discover") }, selected = false,
+                NavigationDrawerItem(label = { Text("Discover") }, selected = showBookDiscovery,
                     icon = { Icon(Icons.Rounded.Search, null) },
-                    onClick = { showBookDiscovery = true; scope.launch { drawer.close() } },
+                    onClick = { selectedBooks = emptySet(); showWebNovelJobs = false; showBookDiscovery = true; scope.launch { drawer.close() } },
                     modifier = Modifier.padding(horizontal = 12.dp))
                 HorizontalDivider(Modifier.padding(vertical = 12.dp))
                 NavigationDrawerItem(label = { Text("Reading statistics") }, selected = false,
@@ -647,7 +670,9 @@ private fun PaperlightAppContent(
         topBar = {
             TopAppBar(
                 title = {
-                    if (selectedBooks.isNotEmpty()) {
+                    if (showBookDiscovery) {
+                        Text("Discover", maxLines = 1, overflow = TextOverflow.Ellipsis, fontFamily = FontFamily.Serif)
+                    } else if (selectedBooks.isNotEmpty()) {
                         val selectedPdf = selectedBooks.singleOrNull()?.let { id ->
                             books.find { it.id == id && it.format == "PDF" }
                         }
@@ -687,13 +712,18 @@ private fun PaperlightAppContent(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = { if (selectedBooks.isEmpty()) scope.launch { drawer.open() } else selectedBooks = emptySet() }) {
-                        Icon(if (selectedBooks.isEmpty()) Icons.Rounded.Menu else Icons.Rounded.Close,
-                            if (selectedBooks.isEmpty()) "Open library menu" else "Clear selection")
+                    IconButton(onClick = {
+                        if (showBookDiscovery || selectedBooks.isEmpty()) scope.launch { drawer.open() }
+                        else selectedBooks = emptySet()
+                    }) {
+                        Icon(if (showBookDiscovery || selectedBooks.isEmpty()) Icons.Rounded.Menu else Icons.Rounded.Close,
+                            if (showBookDiscovery || selectedBooks.isEmpty()) "Open library menu" else "Clear selection")
                     }
                 },
                 actions = {
-                    if (selectedBooks.isNotEmpty()) {
+                    if (showBookDiscovery) {
+                        Unit
+                    } else if (selectedBooks.isNotEmpty()) {
                         selectedBooks.singleOrNull()?.let { id -> books.firstOrNull { it.id == id } }?.let { selected ->
                             Box {
                                 IconButton(onClick = { showSelectedBookActions = true }) {
@@ -766,6 +796,18 @@ private fun PaperlightAppContent(
         bottomBar = { Spacer(Modifier.navigationBarsPadding()) }
       ) { padding ->
           Column(Modifier.fillMaxSize().padding(padding)) {
+            if (showBookDiscovery) {
+                BookDiscoveryScreen(
+                    sources = discoverySources,
+                    viewModel = viewModel,
+                    onDismiss = { showBookDiscovery = false },
+                    onImportEpub = { file, bookTitle, author ->
+                        viewModel.importDownloadedEpub(file, bookTitle, author, activeLibraryId ?: "default")
+                    },
+                    onConvertWebsite = ::beginSourceWebsiteConversion,
+                    onRequestGroqKey = { showGroqApiKeyScreen = true },
+                )
+            } else {
             if (backupProgress != null) {
                 val progress = requireNotNull(backupProgress)
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
@@ -864,20 +906,22 @@ private fun PaperlightAppContent(
                 val toggle: (BookEntity) -> Unit = { book ->
                     selectedBooks = if (book.id in selectedBooks) selectedBooks - book.id else selectedBooks + book.id
                 }
-                if (listView) LazyColumn(Modifier.weight(1f)) {
+                if (listView) LazyColumn(state = libraryListState, modifier = Modifier.weight(1f)) {
                     items(filtered, key = { it.id }) { book ->
                         BookListRow(book, markRecent && book.id == latest, book.id in selectedBooks,
                             onClick = { if (selectedBooks.isEmpty()) selectedId = book.id else toggle(book) }, onLongClick = { toggle(book) })
                     }
                 } else {
                     val rows = filtered.chunked(shelfColumns)
-                    LazyColumn(Modifier.weight(1f).background(Color(0xFF61412C)), contentPadding = PaddingValues(top = 4.dp)) {
+                    LazyColumn(state = libraryShelfState, modifier = Modifier.weight(1f).background(Color(0xFF61412C)),
+                        contentPadding = PaddingValues(top = 4.dp)) {
                         items(count = maxOf(4, rows.size), key = { index -> "shelf:$index" }) { index ->
                             ShelfRow(rows.getOrNull(index).orEmpty(), latest.takeIf { markRecent }, selectedBooks, shelfColumns,
                                 onOpen = { selectedId = it.id }, onToggle = toggle)
                         }
                     }
                 }
+            }
             }
           }
       }
@@ -888,34 +932,6 @@ private fun PaperlightAppContent(
     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
     }
 
-    if (showBookDiscovery) BookDiscoveryScreen(
-        sources = discoverySources,
-        viewModel = viewModel,
-        onDismiss = { showBookDiscovery = false },
-        onImportEpub = { file, title, author ->
-            viewModel.importDownloadedEpub(file, title, author, activeLibraryId ?: "default")
-        },
-        onConvertWebsite = { source, url ->
-            val savedOptions = DiscoverySourceConfigCodec.decode(source.configJson).scrapeOptions
-            val sameSite = sameWebOrigin(source.baseUrl, url)
-            converterSourceId = source.id
-            converterSourceBaseUrl = source.baseUrl
-            savingScrapeSettings = false
-            scrapeSettingsStatus = null
-            applyScrapeOptions(if (sameSite) savedOptions else WebNovelScrapeOptions())
-            showBookDiscovery = false
-            novelUrl = url
-            sampleChapterUrl = ""
-            firstChapter = "1"
-            lastChapter = ""
-            chapterPreview = null
-            previewError = null
-            aiScrapeError = null
-            showScrapeOptions = true
-            showCreateFromWeb = true
-        },
-        onRequestGroqKey = { showGroqApiKeyScreen = true },
-    )
     if (pagerState.settledPage == 0) pendingPdfPath?.let { path ->
         AlertDialog(
             onDismissRequest = { pendingPdfPath = null },

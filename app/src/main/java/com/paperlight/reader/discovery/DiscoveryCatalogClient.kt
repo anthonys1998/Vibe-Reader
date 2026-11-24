@@ -66,6 +66,12 @@ data class DiscoverySourceConfig(
 
 internal data class DiscoveryHtmlAiSample(val finalUrl: String, val html: String)
 
+internal data class DiscoveryFetchedDocument(
+    val document: Document,
+    val finalUrl: String,
+    val contentType: String,
+)
+
 data class DetectedDiscoverySource(
     val kind: String,
     val baseUrl: String,
@@ -192,6 +198,7 @@ object DiscoveryCatalogClient {
         url: String,
         renderJavaScript: Boolean,
         renderedContext: Context?,
+        currentConfig: DiscoverySourceConfig,
     ): DiscoveryHtmlAiSample = withContext(Dispatchers.IO) {
         val document: Document
         val finalUrl: String
@@ -215,9 +222,33 @@ object DiscoveryCatalogClient {
         require(!looksLikeOpds(document, "")) {
             "AI book-list selector setup is for HTML sources. OPDS catalogs do not need CSS selectors."
         }
-        val sample = sanitizedCatalogSample(document)
+        val sampleConfig = if (usesDefaultHtmlSelectors(currentConfig)) detectHtmlSource(document, finalUrl).config
+            else currentConfig
+        val sample = sanitizedCatalogSample(document, sampleConfig)
         require(sample.isNotBlank()) { "This page has no public HTML to configure." }
         DiscoveryHtmlAiSample(finalUrl, sample)
+    }
+
+    internal suspend fun fetchPublicDocument(
+        url: String,
+        renderJavaScript: Boolean = false,
+        renderedContext: Context? = null,
+        ready: (Document) -> Boolean = { it.body()?.text()?.isNotBlank() == true },
+    ): DiscoveryFetchedDocument {
+        if (!renderJavaScript) {
+            val fetched = fetchDocument(url)
+            requirePublicCatalogDocument(fetched.document)
+            return fetched
+        }
+        val context = renderedContext ?: error("Open this source in Discover to render its public page.")
+        val rendered = RenderedNovelPage(context, MAX_CATALOG_BYTES).load(validateHttpUrl(url)) { document ->
+            validateRenderedDocument(document)
+            requirePublicCatalogDocument(document)
+            ready(document)
+        }
+        val finalUrl = validateRenderedDocument(rendered)
+        requirePublicCatalogDocument(rendered)
+        return DiscoveryFetchedDocument(rendered, finalUrl, "text/html")
     }
 
     internal fun validateAiDiscoveryConfig(
@@ -406,13 +437,18 @@ object DiscoveryCatalogClient {
             config.htmlDetailLinkSelector.isNotBlank()) {
             "Configure book-card, title, and details-link selectors for this source."
         }
-        val matchingCards = try { document.select(config.htmlBookSelector) } catch (failure: Exception) {
+        val searchResultsRoot = if (query.isNotBlank())
+            document.selectFirst("[data-search-results], #search-results") else null
+        val catalogRoot = searchResultsRoot ?: document
+        val matchingCards = try { catalogRoot.select(config.htmlBookSelector) } catch (failure: Exception) {
             throw IllegalArgumentException("Invalid book-list CSS selector: ${failure.message}")
         }
         val cards = if (config.excludeNonCatalogRegions == true)
             matchingCards.filterNot(::insideExcludedCatalogRegion).take(48) else matchingCards.take(48)
+        val nextUrl = nextPageLink(document)?.attr("href")?.let { safeResolve(finalUrl, it) }
+        if (cards.isEmpty() && searchResultsRoot != null) return DiscoveryPage(emptyList(), nextUrl = nextUrl)
         require(cards.isNotEmpty()) {
-            "No configured book cards matched. Edit this source's selectors or open its URL in Website to EPUB review."
+            "No configured book cards matched. Edit this source's selectors or choose a public listing page."
         }
         val results = cards.mapNotNull { card ->
             val titleElement = selectFirst(card, config.htmlTitleSelector) ?: return@mapNotNull null
@@ -429,14 +465,26 @@ object DiscoveryCatalogClient {
         val filtered = if (query.isBlank() || config.searchUrlTemplate.isNotBlank()) results else results.filter {
             it.title.contains(query, true) || it.author.contains(query, true)
         }
-        val next = document.selectFirst("a[rel~=next][href]")?.attr("href")
-            ?.let { safeResolve(finalUrl, it) }
-        return DiscoveryPage(filtered.take(24), nextUrl = next)
+        return DiscoveryPage(filtered.take(24), nextUrl = nextUrl)
     }
 
     internal fun parseHtmlWithAutoDetection(document: Document, finalUrl: String, config: DiscoverySourceConfig,
         query: String): DiscoveryPage {
         val initial = runCatching { parseHtmlList(document.outerHtml(), finalUrl, config, query) }.getOrNull()
+        val hasSearchResultsScope = query.isNotBlank() &&
+            document.selectFirst("[data-search-results], #search-results") != null
+        if (hasSearchResultsScope) {
+            if (initial?.books?.isNotEmpty() == true || !usesDefaultHtmlSelectors(config)) return initial
+                ?: parseHtmlList(document.outerHtml(), finalUrl, config, query)
+            val resultsRoot = requireNotNull(document.selectFirst("[data-search-results], #search-results"))
+            val scopedDetection = detectHtmlSource(Jsoup.parse(resultsRoot.outerHtml(), finalUrl), finalUrl)
+            if (scopedDetection.previewTitles.isEmpty()) return initial
+                ?: DiscoveryPage(emptyList(), nextUrl = nextPageLink(document)?.attr("href")
+                    ?.let { safeResolve(finalUrl, it) })
+            val activeConfig = mergeDetectedHtmlConfig(config, scopedDetection.config)
+            return parseHtmlList(document.outerHtml(), finalUrl, activeConfig, query)
+                .copy(detectedConfig = activeConfig)
+        }
         if (initial?.books?.isNotEmpty() == true || !usesDefaultHtmlSelectors(config)) return initial ?:
             parseHtmlList(document.outerHtml(), finalUrl, config, query)
         val detected = detectHtmlSource(document, finalUrl)
@@ -525,7 +573,7 @@ object DiscoveryCatalogClient {
         var config = defaults.copy(
             searchUrlTemplate = findHtmlSearchTemplate(document, finalUrl).orEmpty(),
             htmlLatestUrl = findHtmlModeUrl(document, finalUrl, Regex("latest|new[- ]?releases?|recent(ly)? added", RegexOption.IGNORE_CASE)).orEmpty(),
-            htmlPopularUrl = findHtmlModeUrl(document, finalUrl, Regex("popular|best[- ]?seller|trending|top[- ]rated", RegexOption.IGNORE_CASE)).orEmpty(),
+            htmlPopularUrl = findHtmlModeUrl(document, finalUrl, Regex("popular|hot|best[- ]?seller|trending|top[- ]rated", RegexOption.IGNORE_CASE)).orEmpty(),
             excludeNonCatalogRegions = true,
         )
         val chosen = best
@@ -656,7 +704,7 @@ object DiscoveryCatalogClient {
         a.scheme.equals(b.scheme, true) && a.host.equals(b.host, true) && aPort == bPort
     }.getOrDefault(false)
 
-    private fun parseOpds(response: FetchedDocument): DiscoveryPage {
+    private fun parseOpds(response: DiscoveryFetchedDocument): DiscoveryPage {
         require(!isUnsupportedOpdsJson(response.contentType)) {
             "This source serves OPDS JSON, which is not supported yet. Use an Atom/OPDS catalog URL."
         }
@@ -781,13 +829,11 @@ object DiscoveryCatalogClient {
         val form = document.getElementsByTag("form").firstOrNull {
             it.attr("method").ifBlank { "get" }.equals("get", true) &&
                 it.getElementsByTag("input").any { input ->
-                    input.attr("name").equals("q", true) || input.attr("name").contains("search", true) ||
-                        input.attr("name").contains("query", true)
+                    isSearchFieldName(input.attr("name"))
                 }
         } ?: return null
         val inputName = form.getElementsByTag("input").first {
-            it.attr("name").equals("q", true) || it.attr("name").contains("search", true) ||
-                it.attr("name").contains("query", true)
+            isSearchFieldName(it.attr("name"))
         }.attr("name")
         val action = safeResolve(baseUrl, form.attr("action").ifBlank { baseUrl }) ?: return null
         val encodedName = java.net.URLEncoder.encode(inputName, Charsets.UTF_8.name())
@@ -795,10 +841,15 @@ object DiscoveryCatalogClient {
         return "$action$separator$encodedName={searchTerms}"
     }
 
-    private data class FetchedDocument(val document: Document, val finalUrl: String, val contentType: String)
+    private fun isSearchFieldName(name: String): Boolean =
+        name.equals("q", true) || listOf("search", "query", "keyword", "term").any { name.contains(it, true) }
 
-    private fun sanitizedCatalogSample(document: Document): String {
-        val sample = document.clone()
+    internal fun sanitizedCatalogSample(document: Document, config: DiscoverySourceConfig): String {
+        val sanitized = document.clone()
+        val cards = runCatching { sanitized.select(config.htmlBookSelector).take(8) }.getOrDefault(emptyList())
+        val sample = if (cards.isNotEmpty())
+            Jsoup.parseBodyFragment(cards.joinToString("\n") { it.outerHtml() }, document.baseUri())
+        else sanitized
         sample.select("script, style, noscript, svg, iframe, object, embed, form, nav, footer, header, aside, video, audio, source, link, meta").remove()
         sample.select("*").forEach { element ->
             val allowed = setOf("class", "id", "role", "itemprop", "itemtype", "typeof", "property", "rel", "href", "src", "title")
@@ -819,7 +870,12 @@ object DiscoveryCatalogClient {
         return sample.body()?.html()?.take(12_000).orEmpty()
     }
 
-    private suspend fun fetchDocument(url: String): FetchedDocument = withContext(Dispatchers.IO) {
+    private fun nextPageLink(document: Document): Element? =
+        document.selectFirst(".pagination li.next:not(.last) a[href]")
+            ?: document.selectFirst("li.next:not(.last) a[href]")
+            ?: document.selectFirst("a[rel~=next][href]")
+
+    private suspend fun fetchDocument(url: String): DiscoveryFetchedDocument = withContext(Dispatchers.IO) {
         val safeUrl = validateHttpUrl(url)
         val response = Jsoup.connect(safeUrl)
             .userAgent(USER_AGENT)
@@ -840,7 +896,7 @@ object DiscoveryCatalogClient {
         val contentType = response.contentType().orEmpty()
         val parser = if (contentType.contains("xml", true) || contentType.contains("atom", true))
             Parser.xmlParser() else Parser.htmlParser()
-        FetchedDocument(Jsoup.parse(response.body(), finalUrl, parser), finalUrl, contentType)
+        DiscoveryFetchedDocument(Jsoup.parse(response.body(), finalUrl, parser), finalUrl, contentType)
     }
 
     private fun validateHttpUrl(raw: String): String {
@@ -867,7 +923,7 @@ object DiscoveryCatalogClient {
             .toString().replace(placeholder, "{searchTerms}")
     }.getOrNull()
 
-    private fun expandSearchTemplate(template: String, query: String): String {
+    internal fun expandSearchTemplate(template: String, query: String): String {
         val encoded = URLEncoder.encode(query.trim(), Charsets.UTF_8.name())
         return validateHttpUrl(template.replace("{searchTerms}", encoded).replace("{query}", encoded))
     }

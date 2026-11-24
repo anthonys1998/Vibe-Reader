@@ -232,6 +232,112 @@ class DiscoveryCatalogClientTest {
         assertEquals(2, page.books.size)
     }
 
+    @Test fun novelPingHomepageDetectsKeywordSearchLatestAndHotRoutes() {
+        val home = """
+            <html><body>
+              <form action="/search" method="get"><input type="search" name="keyword"></form>
+              <nav><a href="/sort/updates">Latest Release</a><a href="/sort/hot">Hot Novel</a></nav>
+              <div class="list list-novel col-xs-12">
+                <div class="row"><div class="col-xs-3"><img class="cover novel-cover-loading" src="/covers/one.jpg"></div>
+                  <div class="col-xs-7"><h3 class="novel-title"><a href="/book/one">First Novel</a></h3>
+                    <span class="author">Writer One</span></div></div>
+                <div class="row"><div class="col-xs-3"><img class="cover novel-cover-loading" src="/covers/two.jpg"></div>
+                  <div class="col-xs-7"><h3 class="novel-title"><a href="/book/two">Second Novel</a></h3>
+                    <span class="author">Writer Two</span></div></div>
+              </div>
+            </body></html>
+        """.trimIndent()
+        val base = "https://novelping.com/"
+        val detected = DiscoveryCatalogClient.detectHtmlSource(Jsoup.parse(home, base), base)
+
+        assertEquals("https://novelping.com/search?keyword={searchTerms}", detected.config.searchUrlTemplate)
+        assertEquals("https://novelping.com/sort/updates", detected.config.htmlLatestUrl)
+        assertEquals("https://novelping.com/sort/hot", detected.config.htmlPopularUrl)
+        assertEquals(listOf("First Novel", "Second Novel"), detected.previewTitles)
+
+        val aiSample = DiscoveryCatalogClient.sanitizedCatalogSample(Jsoup.parse(home, base), detected.config)
+        assertFalse(aiSample.contains("Latest Release"))
+        assertEquals(listOf("First Novel", "Second Novel"),
+            DiscoveryCatalogClient.parseHtmlList(aiSample, base, detected.config).books.map { it.title })
+
+        val parsed = DiscoveryCatalogClient.parseHtmlList(home, base, detected.config)
+        assertEquals(2, parsed.books.size)
+        assertEquals("Writer One", parsed.books.first().author)
+        assertEquals("https://novelping.com/book/one", parsed.books.first().detailsUrl)
+        assertEquals("https://novelping.com/covers/one.jpg", parsed.books.first().coverUrl)
+    }
+
+    @Test fun savedNovelPingHomepageSelectorsWorkAcrossModesAndSearchResultsIgnoreSidebar() {
+        val base = "https://novelping.com/"
+        val saved = DiscoverySourceConfig(
+            searchUrlTemplate = "https://novelping.com/search?keyword={query}",
+            htmlLatestUrl = "https://novelping.com/sort/updates",
+            htmlPopularUrl = "https://novelping.com/sort/hot",
+            htmlBookSelector = "div.row",
+            htmlTitleSelector = "h3.novel-title",
+            htmlAuthorSelector = "span.author",
+            htmlDetailLinkSelector = "h3.novel-title a",
+            htmlCoverSelector = "img.cover",
+            excludeNonCatalogRegions = true,
+        )
+        val updates = """
+            <main><div class="list list-novel">
+              <div class="row"><img class="cover" src="/covers/updates.jpg"><h3 class="novel-title"><a href="/book/updates">Updated Story</a></h3><span class="author">Update Writer</span></div>
+              <div class="row"><img class="cover" src="/covers/another.jpg"><h3 class="novel-title"><a href="/book/another">Another Story</a></h3><span class="author">Other Writer</span></div>
+            </div><ul class="pagination"><li class="next"><a href="/sort/updates?page=2">»</a></li>
+              <li class="last"><a href="/sort/updates?page=1421" rel="next">Last »</a></li></ul></main>
+        """.trimIndent()
+        val page = DiscoveryCatalogClient.parseHtmlList(updates, "https://novelping.com/sort/updates", saved)
+        assertEquals(listOf("Updated Story", "Another Story"), page.books.map { it.title })
+        assertEquals("https://novelping.com/sort/updates?page=2", page.nextUrl)
+        assertEquals("https://novelping.com/sort/updates",
+            DiscoveryCatalogClient.configuredModeUrl(base, saved.htmlLatestUrl, "Latest"))
+        assertEquals("https://novelping.com/sort/hot",
+            DiscoveryCatalogClient.configuredModeUrl(base, saved.htmlPopularUrl, "Popular"))
+
+        val hot = """
+            <main><div class="list list-novel">
+              <div class="row"><img class="cover" src="/covers/hot.jpg"><h3 class="novel-title"><a href="/book/hot">Hot Story</a></h3><span class="author">Hot Writer</span></div>
+              <div class="row"><img class="cover" src="/covers/hot-two.jpg"><h3 class="novel-title"><a href="/book/hot-two">Second Hot Story</a></h3><span class="author">Second Hot Writer</span></div>
+            </div></main>
+        """.trimIndent()
+        val hotPage = DiscoveryCatalogClient.parseHtmlList(hot, saved.htmlPopularUrl, saved)
+        assertEquals(listOf("Hot Story", "Second Hot Story"), hotPage.books.map { it.title })
+        assertEquals("Hot Writer", hotPage.books.first().author)
+
+        val searchResults = """
+            <main><div id="search-results" data-search-results>
+              <div class="row"><img class="cover" src="/covers/search.jpg"><h3 class="novel-title"><a href="/book/search">Search Result</a></h3><span class="author">Search Writer</span></div>
+              <div class="row"><img class="cover" src="/covers/search-two.jpg"><h3 class="novel-title"><a href="/book/search-two">Second Search Result</a></h3><span class="author">Second Writer</span></div>
+            </div></main>
+            <aside><div class="row"><h3 class="novel-title"><a href="/book/sidebar">Sidebar Story</a></h3><span class="author">Sidebar Writer</span></div></aside>
+        """.trimIndent()
+        val searched = DiscoveryCatalogClient.parseHtmlList(searchResults, "https://novelping.com/search?keyword=sample", saved, "sample")
+        assertEquals(listOf("Search Result", "Second Search Result"), searched.books.map { it.title })
+        val autoDetectedSearch = DiscoveryCatalogClient.parseHtmlWithAutoDetection(
+            Jsoup.parse(searchResults, "https://novelping.com/search?keyword=sample"),
+            "https://novelping.com/search?keyword=sample",
+            DiscoverySourceConfig(searchUrlTemplate = saved.searchUrlTemplate),
+            "sample",
+        )
+        assertEquals(listOf("Search Result", "Second Search Result"), autoDetectedSearch.books.map { it.title })
+
+        val emptySearch = """
+            <main><div id="search-results" data-search-results><p>No novels found.</p></div></main>
+            <aside><div class="row"><h3 class="novel-title"><a href="/book/sidebar">Sidebar Story</a></h3><span class="author">Sidebar Writer</span></div></aside>
+        """.trimIndent()
+        val emptyResultPage = DiscoveryCatalogClient.parseHtmlWithAutoDetection(
+            Jsoup.parse(emptySearch, "https://novelping.com/search?keyword=missing"),
+            "https://novelping.com/search?keyword=missing",
+            DiscoverySourceConfig(searchUrlTemplate = saved.searchUrlTemplate),
+            "missing",
+        )
+        assertTrue(emptyResultPage.books.isEmpty())
+
+        assertEquals("https://novelping.com/search?keyword=star+%26+sun",
+            DiscoveryCatalogClient.expandSearchTemplate("https://novelping.com/search?keyword={query}", "star & sun"))
+    }
+
     @Test fun sourceConfigCodecReadsPreviousJsonDefaultsAndRoundTripsNewCapabilities() {
         val previous = DiscoverySourceConfigCodec.decode("""{"searchUrlTemplate":"/find?q={searchTerms}","htmlBookSelector":"article.old"}""")
         assertEquals("article.old", previous.htmlBookSelector)

@@ -117,7 +117,8 @@ class GroqAiClient(private val context: Context) {
         currentConfig: DiscoverySourceConfig,
         renderedContext: Context? = null,
     ): DiscoverySourceConfig = withContext(Dispatchers.IO) {
-        val sample = DiscoveryCatalogClient.htmlSampleForAi(url, currentConfig.renderJavaScript, renderedContext)
+        val sample = DiscoveryCatalogClient.htmlSampleForAi(
+            url, currentConfig.renderJavaScript, renderedContext, currentConfig)
         val prompt = """Configure CSS selectors for the repeated book cards in this public HTML catalog. Return ONLY a JSON object with string fields htmlBookSelector, htmlTitleSelector, htmlAuthorSelector, htmlDetailLinkSelector, htmlCoverSelector, and htmlEpubLinkSelector. htmlBookSelector, htmlTitleSelector, and htmlDetailLinkSelector are required. The other selectors may be empty if absent. Use CSS selectors only, and make title/author/details/cover/download selectors relative to the book card. Do not return JavaScript, URLs to fetch, or explanations.
 HTML SAMPLE:
 ${sample.html}"""
