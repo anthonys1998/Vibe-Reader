@@ -9,25 +9,43 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 import com.paperlight.reader.webnovel.WebNovelEpubUtility
+import com.paperlight.reader.webnovel.WebNovelChapterManifestCodec
+import com.paperlight.reader.webnovel.WebNovelChapterManifestStore
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
+import com.paperlight.reader.webnovel.WebNovelWorkerSliceYieldException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 
 private object BookRepositoryOperationLock {
     val mutex = Mutex()
+    private val activeRunnerTokens = mutableSetOf<String>()
+    fun register(token: String) = synchronized(activeRunnerTokens) { activeRunnerTokens.add(token) }
+    fun release(token: String) = synchronized(activeRunnerTokens) { activeRunnerTokens.remove(token) }
+    fun isActive(token: String) = synchronized(activeRunnerTokens) { token in activeRunnerTokens }
 }
 
 class BookRepository(private val context: Context, private val dao: BookDao) {
     companion object {
+        const val MAX_DISCOVERY_CACHE_BYTES = 256 * 1024
+        private const val WORKER_SLICE_RETRY_MILLIS = 15 * 1_000L
+
         fun formatOf(name: String): String? = when (val extension = name.substringAfterLast('.', "").uppercase(java.util.Locale.ROOT)) {
             "EPUB", "PDF", "MOBI", "AZW3", "TXT", "CBZ", "CBR" -> extension
             "AZW" -> "AZW3"
             else -> null
         }
+
+        fun webNovelBookId(url: String, options: WebNovelScrapeOptions): String =
+            "webnovel-${UUID.nameUUIDFromBytes((url + "\n" + options.toString()).toByteArray(Charsets.UTF_8))}"
     }
 
     val books: Flow<List<BookEntity>> = dao.observeBooks()
     val libraries: Flow<List<LibraryEntity>> = dao.observeLibraries()
+    val webNovelJobs: Flow<List<WebNovelJobEntity>> = dao.observeWebNovelJobs()
+    val discoverySources: Flow<List<DiscoverySourceEntity>> = dao.observeDiscoverySources()
 
     private suspend fun <T> withLibraryOperation(allowPendingRestore: Boolean = false, operation: suspend () -> T): T {
         BookRepositoryOperationLock.mutex.lock()
@@ -96,6 +114,7 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
         author: String = "",
         libraryId: String = "default",
         stableId: String? = null,
+        webNovelJob: Pair<String, String>? = null,
     ): Result<BookEntity> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -105,22 +124,31 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
                     require(dao.findLibrary(libraryId) != null) { "That library no longer exists." }
                     val id = stableId ?: UUID.randomUUID().toString()
                     require(id.matches(Regex("[a-zA-Z0-9-]{1,80}"))) { "Invalid generated-book identifier." }
+                    webNovelJob?.let { (jobId, token) ->
+                        val job = requireNotNull(dao.webNovelJobById(jobId)) { "This conversion job no longer exists." }
+                        require(job.runnerToken == token && job.status in setOf(WebNovelJobState.RUNNING, WebNovelJobState.WAITING_RATE_LIMIT)) {
+                            "This conversion was paused, cancelled, or interrupted before import."
+                        }
+                    }
+                    suspend fun markConversionCompleted(bookId: String) {
+                        webNovelJob?.let { (jobId, token) ->
+                            check(dao.completeWebNovelJobWithExistingBook(jobId, token, bookId)) {
+                                "This conversion was paused, cancelled, or interrupted before import."
+                            }
+                            BookRepositoryOperationLock.release(token)
+                        }
+                    }
                     dao.bookById(id)?.let { existing ->
                         file.delete()
+                        markConversionCompleted(existing.id)
                         return@withLibraryOperation existing
                     }
                     val destination = File(File(context.filesDir, "books").apply { mkdirs() }, "$id.epub")
                     val incoming = File(destination.parentFile, ".$id.importing")
                     try {
                         file.copyTo(incoming, overwrite = true)
-                        runCatching {
-                            java.nio.file.Files.move(incoming.toPath(), destination.toPath(),
-                                java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
-                        }.getOrElse {
-                            java.nio.file.Files.move(incoming.toPath(), destination.toPath(),
-                                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                        }
-                        BookEntity(
+                        currentCoroutineContext().ensureActive()
+                        val generatedBook = BookEntity(
                             id = id,
                             title = title.ifBlank { file.nameWithoutExtension },
                             author = author,
@@ -129,13 +157,30 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
                             format = "EPUB",
                             importedAt = System.currentTimeMillis(),
                             libraryId = libraryId
-                        ).also {
-                            dao.insertBook(it)
+                        )
+                        withContext(NonCancellable) {
+                            runCatching {
+                                java.nio.file.Files.move(incoming.toPath(), destination.toPath(),
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+                            }.getOrElse {
+                                java.nio.file.Files.move(incoming.toPath(), destination.toPath(),
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                            }
+                            if (webNovelJob == null) dao.insertBook(generatedBook)
+                            else {
+                                check(dao.insertGeneratedWebNovelBookAndFinish(generatedBook, webNovelJob.first, webNovelJob.second)) {
+                                    "This conversion was paused, cancelled, or interrupted before import."
+                                }
+                                BookRepositoryOperationLock.release(webNovelJob.second)
+                            }
                             file.delete()
                         }
+                        generatedBook
                     } catch (failure: Exception) {
-                        incoming.delete()
-                        destination.delete()
+                        withContext(NonCancellable) {
+                            incoming.delete()
+                            if (dao.bookById(id)?.localPath != destination.absolutePath) destination.delete()
+                        }
                         throw failure
                     }
                 }
@@ -166,20 +211,242 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
         url: String,
         options: WebNovelScrapeOptions = WebNovelScrapeOptions(),
         libraryId: String = "default",
-        onProgress: (Int, Int, String) -> Unit = { _, _, _ -> }
+        webNovelJob: Pair<String, String>? = null,
+        onProgress: suspend (Int, Int, String) -> Unit = { _, _, _ -> },
+        onRateLimitWait: suspend (String, Long?) -> Unit = { _, _ -> },
+        onManifestReady: suspend (String) -> Unit = {},
+        shouldYieldAtChapterBoundary: suspend () -> Boolean = { false },
     ): Result<BookEntity> {
         val tempFile = File(context.cacheDir, "webnovel-${UUID.randomUUID()}.epub")
         return try {
-            val generated = WebNovelEpubUtility(context).createEpub(url, tempFile, options, onProgress)
-            val stableId = "webnovel-${UUID.nameUUIDFromBytes((url + "\n" + options.toString()).toByteArray(Charsets.UTF_8))}"
-            importGeneratedEpub(generated.file, generated.title, libraryId = libraryId, stableId = stableId)
+            val generated = WebNovelEpubUtility(context).createEpub(
+                url, tempFile, options, onProgress, onRateLimitWait, onManifestReady, shouldYieldAtChapterBoundary)
+            val stableId = webNovelBookId(url, options)
+            importGeneratedEpub(generated.file, generated.title, libraryId = libraryId, stableId = stableId,
+                webNovelJob = webNovelJob)
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (deferred: com.paperlight.reader.webnovel.RateLimitDeferredException) {
+            throw deferred
+        } catch (yield: WebNovelWorkerSliceYieldException) {
+            throw yield
         } catch (failure: Exception) {
             Result.failure(failure)
         } finally {
             tempFile.delete()
         }
+    }
+
+    suspend fun enqueueWebNovelConversion(url: String, options: WebNovelScrapeOptions, libraryId: String): WebNovelJobEntity =
+        withContext(Dispatchers.IO) {
+            withLibraryOperation {
+                ensureDefaultLibraryUnlocked()
+                require(dao.findLibrary(libraryId) != null) { "That library no longer exists." }
+                require(url.length <= 4_000) { "The website address is too long." }
+                val bookId = webNovelBookId(url, options)
+                dao.activeWebNovelJobForBook(bookId)?.let { return@withLibraryOperation it }
+                val now = System.currentTimeMillis()
+                val existingBook = dao.bookById(bookId)
+                WebNovelJobEntity(
+                    id = UUID.randomUUID().toString(), sourceUrl = url,
+                    optionsJson = WebNovelScrapeOptionsJson.encode(options), libraryId = libraryId,
+                    status = if (existingBook == null) WebNovelJobState.QUEUED else WebNovelJobState.COMPLETED,
+                    completed = 0, total = 0,
+                    label = if (existingBook == null) "Queued" else "Already in library",
+                    error = null, waitUntil = null, runnerToken = null,
+                    checkpointKey = WebNovelEpubUtility.checkpointKey(url, options),
+                    resultBookId = bookId, bookTitle = existingBook?.title, createdAt = now, updatedAt = now,
+                    autoRun = existingBook == null,
+                ).also { dao.insertWebNovelJob(it) }
+            }
+        }
+
+    suspend fun claimNextWebNovelJob(): WebNovelJobEntity? = claimWebNovelRunner { token, now ->
+        dao.claimNextWebNovelJob(token, now)
+    }
+
+    suspend fun claimRedeliveredWebNovelJob(id: String): WebNovelJobEntity? = claimWebNovelRunner { token, now ->
+        dao.claimRedeliveredWebNovelJob(id, token, now)
+    }
+
+    suspend fun claimAutomaticWebNovelJob(id: String): WebNovelJobEntity? = claimWebNovelRunner { token, now ->
+        dao.claimAutomaticWebNovelJob(id, token, now)
+    }
+
+    private suspend fun claimWebNovelRunner(
+        claim: suspend (token: String, now: Long) -> WebNovelJobEntity?,
+    ): WebNovelJobEntity? {
+        val token = UUID.randomUUID().toString()
+        return try {
+            withContext(Dispatchers.IO) {
+                withLibraryOperation {
+                    reconcileOrphanedWebNovelJobsUnlocked()
+                    claim(token, System.currentTimeMillis())?.also { BookRepositoryOperationLock.register(token) }
+                }
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            runCatching {
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    withLibraryOperation(allowPendingRestore = true) {
+                        try {
+                            dao.allWebNovelJobs().firstOrNull { it.runnerToken == token }?.let { job ->
+                                dao.reconcileOrphanedWebNovelJob(job.id, token, System.currentTimeMillis())
+                            }
+                        } finally {
+                            BookRepositoryOperationLock.release(token)
+                        }
+                    }
+                }
+            }
+            throw cancelled
+        }
+    }
+
+    suspend fun automaticWebNovelJobs(): List<WebNovelJobEntity> = withContext(Dispatchers.IO) {
+        withLibraryOperation { dao.automaticWebNovelJobs() }
+    }
+
+    suspend fun postponeAutomaticWebNovelJob(id: String, delayMillis: Long = 30_000L): WebNovelJobEntity? = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            val now = System.currentTimeMillis()
+            if (dao.postponeAutomaticWebNovelJob(id, now, now + delayMillis.coerceIn(10_000L, 5 * 60_000L)) == 0) null
+            else dao.webNovelJobById(id)
+        }
+    }
+
+    suspend fun continueWebNovelJobAfterWorkerSlice(id: String, token: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            val now = System.currentTimeMillis()
+            (dao.continueWebNovelJobAfterWorkerSlice(id, token, now + WORKER_SLICE_RETRY_MILLIS, now) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun forgetWebNovelRunnerToken(token: String) = withContext(Dispatchers.IO) {
+        try {
+            withLibraryOperation(allowPendingRestore = true) {
+                dao.allWebNovelJobs().firstOrNull { it.runnerToken == token }?.let { job ->
+                    dao.reconcileOrphanedWebNovelJob(job.id, token, System.currentTimeMillis())
+                }
+            }
+        } finally {
+            BookRepositoryOperationLock.mutex.lock()
+            try {
+                BookRepositoryOperationLock.release(token)
+            } finally {
+                BookRepositoryOperationLock.mutex.unlock()
+            }
+        }
+    }
+
+    suspend fun updateWebNovelJobProgress(
+        id: String, token: String, status: String, completed: Int, total: Int, label: String, waitUntil: Long? = null,
+    ): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            dao.updateWebNovelJobProgress(id, token, status, completed, total, label, waitUntil, System.currentTimeMillis()) > 0
+        }
+    }
+
+    suspend fun updateWebNovelJobTitle(id: String, token: String, title: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            dao.updateWebNovelJobTitle(id, token, title.take(512), System.currentTimeMillis()) > 0
+        }
+    }
+
+    suspend fun failWebNovelJob(id: String, token: String, error: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.finishWebNovelJob(id, token, WebNovelJobState.FAILED, "Failed", error.take(1_000),
+                requireNotNull(dao.webNovelJobById(id)).resultBookId, System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun settleWebNovelJobRequest(id: String, token: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.settleWebNovelJobRequest(id, token, System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun interruptWebNovelJob(id: String, token: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.interruptWebNovelJob(id, token, System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun deferWebNovelJobForRateLimit(id: String, token: String, host: String, waitUntil: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            withLibraryOperation {
+                (dao.deferWebNovelJobForRateLimit(id, token, "Waiting for $host rate limit", waitUntil,
+                    System.currentTimeMillis()) > 0).also { if (it) BookRepositoryOperationLock.release(token) }
+            }
+        }
+
+    suspend fun webNovelJobById(id: String): WebNovelJobEntity? = withContext(Dispatchers.IO) {
+        dao.webNovelJobById(id)
+    }
+
+    suspend fun requestPauseWebNovelJob(id: String): WebNovelJobEntity? = withContext(Dispatchers.IO) {
+        withLibraryOperation { dao.requestPauseWebNovelJob(id, System.currentTimeMillis()) }
+    }
+
+    suspend fun requestCancelWebNovelJob(id: String): WebNovelJobEntity? = withContext(Dispatchers.IO) {
+        withLibraryOperation { dao.requestCancelWebNovelJob(id, System.currentTimeMillis()) }
+    }
+
+    suspend fun resumeWebNovelJob(id: String): WebNovelJobEntity? = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            val existing = dao.webNovelJobById(id) ?: return@withLibraryOperation null
+            check(dao.findLibrary(existing.libraryId) != null) { "The saved destination library no longer exists." }
+            dao.resumeWebNovelJob(id, System.currentTimeMillis())
+        }
+    }
+
+    suspend fun resetInvalidWebNovelChapterManifest(id: String): WebNovelJobEntity? = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            val job = dao.webNovelJobById(id) ?: return@withLibraryOperation null
+            check(job.status == WebNovelJobState.FAILED &&
+                job.error?.startsWith(WebNovelChapterManifestCodec.INVALID_MANIFEST_ERROR_PREFIX) == true) {
+                "Only a failed conversion with an invalid saved chapter list can be reset."
+            }
+            check(dao.findLibrary(job.libraryId) != null) { "The saved destination library no longer exists." }
+            val options = WebNovelScrapeOptionsJson.decode(job.optionsJson)
+            val checkpointKey = WebNovelEpubUtility.checkpointKey(job.sourceUrl, options)
+            check(checkpointKey.matches(Regex("[0-9a-f]{64}"))) { "The saved checkpoint path is invalid." }
+            check(!dao.hasOtherNonterminalWebNovelJobForCheckpoint(id, checkpointKey)) {
+                "Finish or cancel other website conversions before resetting this chapter list."
+            }
+            val directory = File(context.filesDir, "webnovel-checkpoints/$checkpointKey")
+            check(WebNovelChapterManifestStore(directory).clear()) { "Could not reset the saved chapter list." }
+            check(dao.requeueFailedWebNovelJobAfterManifestReset(id, System.currentTimeMillis()) > 0) {
+                "This conversion changed while its chapter list was being reset."
+            }
+            dao.webNovelJobById(id)
+        }
+    }
+
+    suspend fun reconcileWebNovelJobs(@Suppress("UNUSED_PARAMETER") serviceActive: Boolean) = withContext(Dispatchers.IO) {
+        withLibraryOperation { reconcileOrphanedWebNovelJobsUnlocked() }
+    }
+
+    private suspend fun reconcileOrphanedWebNovelJobsUnlocked() {
+        val now = System.currentTimeMillis()
+        dao.allWebNovelJobs().forEach { job ->
+            val token = job.runnerToken ?: return@forEach
+            if (!BookRepositoryOperationLock.isActive(token) && dao.reconcileOrphanedWebNovelJob(job.id, token, now) > 0) {
+                BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun hasQueuedOrActiveWebNovelJobs(): Boolean = withContext(Dispatchers.IO) {
+        dao.hasWebNovelJobsInStates(listOf(WebNovelJobState.QUEUED, WebNovelJobState.RUNNING,
+            WebNovelJobState.WAITING_RATE_LIMIT, WebNovelJobState.PAUSE_REQUESTED, WebNovelJobState.CANCEL_REQUESTED))
     }
 
     suspend fun import(uri: Uri, libraryId: String = "default"): Result<BookEntity> = withContext(Dispatchers.IO) {
@@ -229,7 +496,10 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
         password: String? = null,
         onProgress: (BackupProgress) -> Unit = {},
     ) = withContext(Dispatchers.IO) {
-        withLibraryOperation { LibraryBackup(context, dao).export(uri, includeApiKey, password, onProgress) }
+        withLibraryOperation {
+            check(!dao.hasActiveWebNovelJob()) { "Pause or cancel the active website EPUB job before exporting a backup." }
+            LibraryBackup(context, dao).export(uri, includeApiKey, password, onProgress)
+        }
     }
 
     suspend fun recoverInterruptedBackupRestore() = withContext(Dispatchers.IO) {
@@ -245,6 +515,9 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
         onProgress: (BackupProgress) -> Unit = {},
     ): Int = withContext(Dispatchers.IO) {
         withLibraryOperation {
+            check(!dao.hasActiveWebNovelJob()) {
+                "Pause or cancel the active website EPUB job before restoring a backup."
+            }
             LibraryBackup(context, dao).restore(uri, password, replaceExistingSettings, replaceExistingGroqKey, onProgress)
         }
     }
@@ -261,6 +534,72 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
 
     suspend fun updateProgress(bookId: String, progress: Float) = withContext(Dispatchers.IO) {
         withLibraryOperation { dao.updateProgress(bookId, progress.coerceIn(0f, 1f)) }
+    }
+
+    suspend fun saveDiscoverySource(source: DiscoverySourceEntity) = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            require(source.name.isNotBlank() && source.name.length <= 120) { "Source names must contain at most 120 characters." }
+            require(source.baseUrl.length <= 4_096 && source.configJson.toByteArray(Charsets.UTF_8).size <= 32 * 1024) {
+                "Source settings exceed the size limit."
+            }
+            val sourceUri = java.net.URI(source.baseUrl.trim())
+            require((sourceUri.scheme.equals("http", true) || sourceUri.scheme.equals("https", true)) &&
+                !sourceUri.host.isNullOrBlank() && sourceUri.userInfo == null) {
+                "Source URLs must be HTTP(S), include a host, and contain no credentials."
+            }
+            require(source.kind in setOf(DiscoverySourceKind.OPDS, DiscoverySourceKind.HTML)) {
+                "Only detected OPDS catalogs and HTML websites can be added as custom sources."
+            }
+            val config = org.json.JSONObject(source.configJson)
+            if (source.kind == DiscoverySourceKind.HTML) {
+                require(config.optString("htmlBookSelector").isNotBlank() &&
+                    config.optString("htmlTitleSelector").isNotBlank() &&
+                    config.optString("htmlDetailLinkSelector").isNotBlank()) {
+                    "HTML sources need book-card, title, and details-link selectors."
+                }
+            }
+            require(source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+                "Built-in sources cannot be edited."
+            }
+            val existing = dao.discoverySourceById(source.id)
+            if (existing == null) dao.insertDiscoverySource(source) else dao.updateDiscoverySource(source)
+        }
+    }
+
+    suspend fun setDiscoverySourceEnabled(id: String, enabled: Boolean) = withContext(Dispatchers.IO) {
+        withLibraryOperation { dao.setDiscoverySourceEnabled(id, enabled, System.currentTimeMillis()) > 0 }
+    }
+
+    suspend fun deleteDiscoverySource(id: String) = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            require(id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+                "Built-in sources cannot be deleted."
+            }
+            dao.deleteDiscoverySource(id) > 0
+        }
+    }
+
+    suspend fun cacheDiscoverySourceResults(source: DiscoverySourceEntity, cacheKey: String, cacheJson: String): Boolean =
+        withContext(Dispatchers.IO) {
+            if (cacheJson.toByteArray(Charsets.UTF_8).size > MAX_DISCOVERY_CACHE_BYTES) return@withContext false
+            withLibraryOperation {
+                dao.cacheDiscoverySourceResults(source.id, source.kind, source.baseUrl, source.configJson, source.updatedAt, cacheKey, cacheJson,
+                    System.currentTimeMillis()) > 0
+            }
+        }
+
+    suspend fun exportBook(bookId: String, destination: Uri): String = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            val book = dao.bookById(bookId) ?: error("This book is no longer in the library.")
+            val source = File(book.localPath)
+            require(source.isFile && source.canRead()) { "The original book file is missing or unreadable." }
+            source.inputStream().use { input ->
+                val output = context.contentResolver.openOutputStream(destination, "wt")
+                    ?: error("Could not write the exported book.")
+                output.use { input.copyTo(it) }
+            }
+            book.fileName
+        }
     }
 
     suspend fun remove(book: BookEntity) = withContext(Dispatchers.IO) {

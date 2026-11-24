@@ -38,6 +38,9 @@ data class WebNovelEpubResult(val file: File, val title: String, val chapterCoun
 data class WebNovelPreview(val chapterCount: Int, val chapterTitle: String, val excerpt: String)
 data class WebNovelAiSamples(val tocHtml: String, val chapterHtml: String)
 
+class RateLimitDeferredException(val host: String, val waitUntil: Long) : Exception("The site asked the reader to wait before retrying.")
+class WebNovelWorkerSliceYieldException : Exception("This conversion saved its chapter checkpoint and will continue automatically.")
+
 /** Scrapes a user-supplied novel TOC and writes a DRM-free EPUB without blocking the UI dispatcher. */
 class WebNovelEpubUtility(context: Context) {
     private val context = context.applicationContext
@@ -76,29 +79,54 @@ class WebNovelEpubUtility(context: Context) {
         tableOfContentsUrl: String,
         destination: File,
         options: WebNovelScrapeOptions = WebNovelScrapeOptions(),
-        onProgress: (Int, Int, String) -> Unit = { _, _, _ -> }
+        onProgress: suspend (Int, Int, String) -> Unit = { _, _, _ -> },
+        onRateLimitWait: suspend (String, Long?) -> Unit = { _, _ -> },
+        onManifestReady: suspend (String) -> Unit = {},
+        shouldYieldAtChapterBoundary: suspend () -> Boolean = { false },
     ): WebNovelEpubResult = withContext(Dispatchers.IO) {
         val start = validateHttpUrl(tableOfContentsUrl)
         require(options.requestDelayMillis in 0L..10_000L) { "Request delay must be between 0 and 10 seconds." }
+        val checkpointKey = checkpointKey(start.toString(), options)
+        val checkpointDirectory = File(context.filesDir, "webnovel-checkpoints/$checkpointKey")
+            .apply { check(isDirectory || mkdirs()) { "Could not create conversion checkpoint storage." } }
 
         var completed = false
         try {
-            onProgress(0, 0, "Finding chapters…")
-            val (toc, allLinks) = chapterIndex(start.toString(), options)
-            val links = allLinks.inRange(options)
-            val bookTitle = toc.selectFirst("h1")?.text()?.trim()?.takeIf(String::isNotBlank)
-                ?: toc.selectFirst("meta[property=og:site_name]")?.attr("content")?.trim()
-                    ?.takeIf(String::isNotBlank)
-                ?: toc.title().trim().ifBlank { start.host }
-
-            val title = if (links.size == allLinks.size) bookTitle
-                else "$bookTitle (Chapters ${options.firstChapter}–${options.lastChapter ?: allLinks.size})"
+            onProgress(0, 0, "Loading chapter list…")
+            val manifest = WebNovelChapterManifestStore(checkpointDirectory).loadOrCreate(
+                sourceUrl = start.toString(),
+                checkpointKey = checkpointKey,
+            ) {
+                val (toc, allLinks) = chapterIndex(start.toString(), options, onRateLimitWait)
+                val links = allLinks.inRange(options)
+                val tocUrl = validateHttpUrl(toc.baseUri()).toString()
+                val bookTitle = toc.selectFirst("h1")?.text()?.trim()?.takeIf(String::isNotBlank)
+                    ?: toc.selectFirst("meta[property=og:site_name]")?.attr("content")?.trim()
+                        ?.takeIf(String::isNotBlank)
+                    ?: toc.title().trim().ifBlank { start.host }
+                val title = if (links.size == allLinks.size) bookTitle
+                    else "$bookTitle (Chapters ${options.firstChapter}–${options.lastChapter ?: allLinks.size})"
+                WebNovelChapterManifest(
+                    sourceUrl = start.toString(), tocUrl = tocUrl, checkpointKey = checkpointKey, title = title.take(512),
+                    chapters = links.mapIndexed { index, (url, label) ->
+                        WebNovelChapterLink(url, label ?: "Chapter ${options.firstChapter + index}")
+                    },
+                    coverImageUrl = coverImageUrl(toc, validateHttpUrl(tocUrl)),
+                )
+            }
+            val links = manifest.chapters.map { it.url to it.label }
+            val lastUncachedChapter = links.indices.lastOrNull { index ->
+                val stem = "chapter-${index.toString().padStart(5, '0')}"
+                File(checkpointDirectory, "$stem.xhtml").isFile && File(checkpointDirectory, "$stem.url").let { urlFile ->
+                    !urlFile.isFile || runCatching { urlFile.readText() != links[index].first }.getOrDefault(true)
+                } || !File(checkpointDirectory, "$stem.xhtml").isFile
+            } ?: -1
+            val title = manifest.title
+            onManifestReady(title)
             val epub = Book().apply { metadata.addTitle(title) }
-            findCoverImage(toc, start)?.let(epub::setCoverImage)
+            fetchCoverImage(manifest.coverImageUrl)?.let(epub::setCoverImage)
             onProgress(0, links.size, title)
             var totalTextBytes = 0L
-            val checkpointDirectory = File(context.filesDir, "webnovel-checkpoints/${checkpointKey(start.toString(), options)}")
-                .apply { check(isDirectory || mkdirs()) { "Could not create conversion checkpoint storage." } }
             links.forEachIndexed { index, (url, linkLabel) ->
                 coroutineContext.ensureActive()
                 val cacheFile = File(checkpointDirectory, "chapter-${index.toString().padStart(5, '0')}.xhtml")
@@ -107,7 +135,7 @@ class WebNovelEpubUtility(context: Context) {
                     runCatching { urlFile.readText() == url }.getOrDefault(false)
                 val xhtml = if (cached) cacheFile.readText(Charsets.UTF_8) else {
                     if (index > 0 && options.requestDelayMillis > 0L) delay(options.requestDelayMillis)
-                    val chapterDoc = chapterDocument(url, options)
+                    val chapterDoc = chapterDocument(url, options, onRateLimitWait)
                     val chapterTitle = chapterTitle(chapterDoc, options)
                         ?: linkLabel
                         ?: "Chapter ${options.firstChapter + index}"
@@ -127,6 +155,7 @@ class WebNovelEpubUtility(context: Context) {
                 val resource = Resource(ByteArrayInputStream(bytes), "chapter-${(index + 1).toString().padStart(4, '0')}.xhtml")
                 epub.addSection(chapterTitle, resource)
                 onProgress(index + 1, links.size, if (cached) "Restored $chapterTitle" else chapterTitle)
+                if (!cached && index < lastUncachedChapter && shouldYieldAtChapterBoundary()) throw WebNovelWorkerSliceYieldException()
             }
 
             coroutineContext.ensureActive()
@@ -144,6 +173,7 @@ class WebNovelEpubUtility(context: Context) {
     private suspend fun chapterIndex(
         url: String,
         options: WebNovelScrapeOptions,
+        onRateLimitWait: suspend (String, Long?) -> Unit = { _, _ -> },
     ): Pair<Document, List<Pair<String, String?>>> {
         val start = validateHttpUrl(url)
         fun links(document: Document): List<Pair<String, String?>> {
@@ -154,6 +184,7 @@ class WebNovelEpubUtility(context: Context) {
             return extractChapterLinks(document, origin, selector)
         }
         val toc = if (options.renderInBrowser) {
+            awaitCooldown(start.toString(), onRateLimitWait)
             renderer.load(start.toString()) { document ->
                 val found = links(document).size
                 val expected = if (isNovelBin(document) && options.chapterLinkSelector == "a[href]") {
@@ -161,7 +192,7 @@ class WebNovelEpubUtility(context: Context) {
                 } else null
                 found > 0 && (expected == null || found >= expected)
             }
-        } else fetch(start.toString())
+        } else fetch(start.toString(), onRateLimitWait)
         val chapterLinks = links(toc)
         require(chapterLinks.isNotEmpty()) {
             "No chapter links found. Check the table of contents URL and selectors, or enable browser rendering."
@@ -188,8 +219,13 @@ class WebNovelEpubUtility(context: Context) {
         return chapter.toString()
     }
 
-    private suspend fun chapterDocument(url: String, options: WebNovelScrapeOptions): Document {
-        if (!options.renderInBrowser) return fetch(url)
+    private suspend fun chapterDocument(
+        url: String,
+        options: WebNovelScrapeOptions,
+        onRateLimitWait: suspend (String, Long?) -> Unit = { _, _ -> },
+    ): Document {
+        if (!options.renderInBrowser) return fetch(url, onRateLimitWait)
+        awaitCooldown(url, onRateLimitWait)
         return renderer.load(url) { document ->
             val paragraphs = chapterParagraphs(document, options, chapterTitle(document, options))
             paragraphs.sumOf { it.length } >= 40
@@ -215,13 +251,12 @@ class WebNovelEpubUtility(context: Context) {
     private fun isNovelBin(document: Document): Boolean =
         validateHttpUrl(document.baseUri()).host.equals("novelbin.xyz", true)
 
-    private suspend fun fetch(url: String): Document {
+    private suspend fun fetch(url: String, onRateLimitWait: suspend (String, Long?) -> Unit = { _, _ -> }): Document {
         var attempts = 0
-        val host = requireNotNull(validateHttpUrl(url).host)
+        val host = requireNotNull(validateHttpUrl(url).host).lowercase(java.util.Locale.ROOT)
         while (true) {
             coroutineContext.ensureActive()
-            val cooldownUntil = cooldownPreferences.getLong(host, 0L)
-            if (cooldownUntil > System.currentTimeMillis()) delay(cooldownUntil - System.currentTimeMillis())
+            awaitCooldown(url, onRateLimitWait)
             val response = try {
                 Jsoup.connect(url)
                     .userAgent(USER_AGENT)
@@ -233,31 +268,47 @@ class WebNovelEpubUtility(context: Context) {
             } catch (failure: IOException) {
                 attempts++
                 if (attempts > MAX_RATE_LIMIT_RETRIES) throw failure
-                persistCooldown(host, retryAfterMillis(null, attempts))
+                persistCooldown(host, retryAfterMillis(null, attempts), onRateLimitWait)
                 continue
             }
             if (response.statusCode() == 429) {
                 attempts++
                 require(attempts <= MAX_RATE_LIMIT_RETRIES) { "The website is still rate limiting requests. Resume this conversion later." }
-                persistCooldown(host, retryAfterMillis(response.header("Retry-After"), attempts))
+                persistCooldown(host, retryAfterMillis(response.header("Retry-After"), attempts), onRateLimitWait)
                 continue
             }
             if (response.statusCode() in 500..599) {
                 attempts++
                 if (attempts > MAX_RATE_LIMIT_RETRIES) error("Website returned HTTP ${response.statusCode()} after repeated retries.")
-                persistCooldown(host, retryAfterMillis(null, attempts))
+                persistCooldown(host, retryAfterMillis(null, attempts), onRateLimitWait)
                 continue
             }
             require(response.statusCode() in 200..299) { "Website returned HTTP ${response.statusCode()} for $url." }
             cooldownPreferences.edit().remove(host).apply()
+            onRateLimitWait(host, null)
             return response.parse()
         }
     }
 
-    private suspend fun persistCooldown(host: String, delayMillis: Long) {
+    private suspend fun awaitCooldown(url: String, onRateLimitWait: suspend (String, Long?) -> Unit) {
+        val host = requireNotNull(validateHttpUrl(url).host).lowercase(java.util.Locale.ROOT)
+        val cooldownUntil = cooldownPreferences.getLong(host, 0L)
+        if (cooldownUntil > System.currentTimeMillis()) {
+            onRateLimitWait(host, cooldownUntil)
+            val remaining = cooldownUntil - System.currentTimeMillis()
+            if (remaining > MAX_INLINE_WAIT_MILLIS) throw RateLimitDeferredException(host, cooldownUntil)
+            delay(remaining)
+            onRateLimitWait(host, null)
+        }
+    }
+
+    private suspend fun persistCooldown(host: String, delayMillis: Long, onRateLimitWait: suspend (String, Long?) -> Unit) {
         val until = System.currentTimeMillis() + delayMillis
-        cooldownPreferences.edit().putLong(host, until).apply()
+        check(cooldownPreferences.edit().putLong(host, until).commit()) { "Could not save the website's retry deadline." }
+        onRateLimitWait(host, until)
+        if (delayMillis > MAX_INLINE_WAIT_MILLIS) throw RateLimitDeferredException(host, until)
         delay((until - System.currentTimeMillis()).coerceAtLeast(1L))
+        onRateLimitWait(host, null)
     }
 
     private fun retryAfterMillis(header: String?, attempt: Int): Long {
@@ -280,14 +331,7 @@ class WebNovelEpubUtility(context: Context) {
         }
     }
 
-    private fun checkpointKey(url: String, options: WebNovelScrapeOptions): String {
-        val config = listOf(url, options.chapterLinkSelector, options.chapterContentSelector,
-            options.chapterTitleSelector, options.removeSelector, options.firstChapter.toString(),
-            options.lastChapter?.toString().orEmpty(), options.renderInBrowser.toString()).joinToString("\n")
-        return MessageDigest.getInstance("SHA-256").digest(config.toByteArray()).joinToString("") { "%02x".format(it) }
-    }
-
-    private fun findCoverImage(toc: Document, pageUrl: URI): Resource? {
+    private fun coverImageUrl(toc: Document, pageUrl: URI): String? {
         val imageUrl = sequenceOf(
             toc.selectFirst("meta[property=og:image]")?.attr("content"),
             toc.selectFirst("meta[name=twitter:image]")?.attr("content"),
@@ -300,8 +344,15 @@ class WebNovelEpubUtility(context: Context) {
                     !uri.host.isNullOrBlank() && uri.userInfo == null
             } ?: return null
 
+        return imageUrl.toString()
+    }
+
+    private fun fetchCoverImage(imageUrl: String?): Resource? {
+        if (imageUrl == null) return null
+        val host = runCatching { requireNotNull(validateHttpUrl(imageUrl).host).lowercase(java.util.Locale.ROOT) }.getOrNull()
+        if (host != null && cooldownPreferences.getLong(host, 0L) > System.currentTimeMillis()) return null
         return runCatching {
-            val response = Jsoup.connect(imageUrl.toString())
+            val response = Jsoup.connect(imageUrl)
                 .userAgent(USER_AGENT)
                 .timeout(15_000)
                 .maxBodySize(MAX_COVER_BYTES)
@@ -393,7 +444,8 @@ class WebNovelEpubUtility(context: Context) {
     }
 
     private fun sameOrigin(base: URI, candidate: URI): Boolean =
-        base.host.equals(candidate.host, ignoreCase = true) && effectivePort(base) == effectivePort(candidate)
+        base.scheme.equals(candidate.scheme, ignoreCase = true) &&
+            base.host.equals(candidate.host, ignoreCase = true) && effectivePort(base) == effectivePort(candidate)
 
     private fun effectivePort(uri: URI): Int = when {
         uri.port >= 0 -> uri.port
@@ -409,7 +461,16 @@ class WebNovelEpubUtility(context: Context) {
     private fun String.xmlEscape(): String = replace("&", "&amp;").replace("<", "&lt;")
         .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;")
 
-    private companion object {
+    companion object {
+        const val MAX_INLINE_WAIT_MILLIS = 60_000L
+        fun checkpointKey(url: String, options: WebNovelScrapeOptions): String {
+            val canonicalUrl = runCatching { URI(url.trim()).normalize().toString() }.getOrDefault(url)
+            val config = listOf(canonicalUrl, options.chapterLinkSelector, options.chapterContentSelector,
+                options.chapterTitleSelector, options.removeSelector, options.firstChapter.toString(),
+                options.lastChapter?.toString().orEmpty(), options.renderInBrowser.toString()).joinToString("\n")
+            return MessageDigest.getInstance("SHA-256").digest(config.toByteArray()).joinToString("") { "%02x".format(it) }
+        }
+
         const val MAX_RATE_LIMIT_RETRIES = 5
         const val MAX_TRANSIENT_RETRY_DELAY_MILLIS = 30L * 60 * 1_000
         const val MAX_RATE_LIMIT_DELAY_MILLIS = 7L * 24 * 60 * 60 * 1_000

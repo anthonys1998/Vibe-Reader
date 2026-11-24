@@ -4,6 +4,11 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+val appVersionCode = providers.gradleProperty("appVersionCode").orNull?.let { raw ->
+    raw.toIntOrNull() ?: throw GradleException("appVersionCode must be an integer.")
+} ?: 41
+if (appVersionCode !in 1..2_100_000_000) throw GradleException("appVersionCode must be between 1 and 2,100,000,000.")
+
 android {
     namespace = "com.paperlight.reader"
     compileSdk = 36
@@ -20,7 +25,7 @@ android {
         applicationId = "com.paperlight.reader"
         minSdk = 26
         targetSdk = 36
-        versionCode = providers.gradleProperty("appVersionCode").orElse("41").get().toInt()
+        versionCode = appVersionCode
         versionName = "1.9"
     }
 
@@ -78,6 +83,7 @@ dependencies {
 
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
+    implementation(libs.androidx.work.runtime)
     ksp(libs.androidx.room.compiler)
 
     implementation(libs.androidx.datastore.preferences)
@@ -86,5 +92,6 @@ dependencies {
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation(libs.junit)
+    testImplementation(libs.androidx.work.testing)
     testImplementation("org.robolectric:robolectric:4.14.1")
 }

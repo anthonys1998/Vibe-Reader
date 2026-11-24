@@ -7,12 +7,17 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.paperlight.reader.data.BookEntity
 import com.paperlight.reader.data.BookRepository
+import com.paperlight.reader.data.DiscoverySourceEntity
 import com.paperlight.reader.data.BackupProgress
 import com.paperlight.reader.data.BackupProgressStage
 import com.paperlight.reader.data.PdfEpubMode
+import com.paperlight.reader.data.WebNovelJobEntity
+import com.paperlight.reader.data.WebNovelJobState
 import java.io.File
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import com.paperlight.reader.webnovel.WebNovelExportService
+import com.paperlight.reader.webnovel.WebNovelChapterManifestCodec
+import com.paperlight.reader.webnovel.WebNovelRecoveryWorker
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -30,6 +35,12 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
         emptyList()
+    )
+    val webNovelJobs = repository.webNovelJobs.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
+    )
+    val discoverySources = repository.discoverySources.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
     )
 
     private val _message = MutableStateFlow<String?>(null)
@@ -55,6 +66,8 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
             try {
                 repository.recoverInterruptedBackupRestore()
                 repository.ensureDefaultLibrary()
+                repository.reconcileWebNovelJobs(WebNovelExportService.isServiceActive())
+                WebNovelRecoveryWorker.scheduleAutomaticJobs(context, repository)
                 repository.refreshMetadata()
                 _backupRecoveryBlocked.value = false
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -70,6 +83,67 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
 
     fun clearMessage(shown: String) {
         _message.compareAndSet(shown, null)
+    }
+
+    fun saveDiscoverySource(source: DiscoverySourceEntity, onComplete: (Boolean) -> Unit = {}) {
+        if (!recoveryAllowsLibraryAction()) { onComplete(false); return }
+        viewModelScope.launch {
+            try {
+                repository.saveDiscoverySource(source)
+                _message.value = "Saved ${source.name}."
+                onComplete(true)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not save this source."
+                onComplete(false)
+            }
+        }
+    }
+
+    fun setDiscoverySourceEnabled(id: String, enabled: Boolean, onComplete: (Boolean) -> Unit = {}) {
+        if (!recoveryAllowsLibraryAction()) { onComplete(false); return }
+        viewModelScope.launch {
+            try {
+                onComplete(repository.setDiscoverySourceEnabled(id, enabled))
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not update this source."
+                onComplete(false)
+            }
+        }
+    }
+
+    fun deleteDiscoverySource(id: String, onComplete: (Boolean) -> Unit = {}) {
+        if (!recoveryAllowsLibraryAction()) { onComplete(false); return }
+        viewModelScope.launch {
+            try {
+                val deleted = repository.deleteDiscoverySource(id)
+                if (!deleted) _message.value = "This source was already removed."
+                onComplete(deleted)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not remove this source."
+                onComplete(false)
+            }
+        }
+    }
+
+    fun cacheDiscoverySourceResults(source: DiscoverySourceEntity, key: String, json: String,
+        onComplete: (Boolean) -> Unit = {}) {
+        if (!recoveryAllowsLibraryAction()) { onComplete(false); return }
+        viewModelScope.launch {
+            try {
+                onComplete(repository.cacheDiscoverySourceResults(source, key, json))
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not cache search results."
+                onComplete(false)
+            }
+        }
     }
 
     private fun recoveryAllowsLibraryAction(): Boolean {
@@ -144,6 +218,19 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
     fun updateProgress(bookId: String, progress: Float) {
         if (!recoveryAllowsLibraryAction()) return
         viewModelScope.launch { repository.updateProgress(bookId, progress) }
+    }
+
+    fun exportBook(bookId: String, destination: Uri) {
+        if (!recoveryAllowsLibraryAction()) return
+        viewModelScope.launch {
+            try {
+                _message.value = "Exported ${repository.exportBook(bookId, destination)}."
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not export this book."
+            }
+        }
     }
 
     fun remove(book: BookEntity) {
@@ -270,6 +357,80 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
         }
     }
 
+    fun pauseWebNovelJob(id: String) {
+        viewModelScope.launch {
+            try {
+                val job = repository.requestPauseWebNovelJob(id)
+                WebNovelRecoveryWorker.cancel(context, id)
+                if (job?.status == WebNovelJobState.PAUSE_REQUESTED && job.runnerType != "WORKER") WebNovelExportService.pause(context, id)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not pause this conversion."
+            }
+        }
+    }
+
+    fun cancelWebNovelJob(id: String) {
+        viewModelScope.launch {
+            try {
+                val job = repository.requestCancelWebNovelJob(id)
+                WebNovelRecoveryWorker.cancel(context, id)
+                if (job?.status == WebNovelJobState.CANCEL_REQUESTED && job.runnerType != "WORKER") WebNovelExportService.cancel(context, id)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not cancel this conversion."
+            }
+        }
+    }
+
+    fun resumeWebNovelJob(id: String) {
+        viewModelScope.launch {
+            try {
+                val current = repository.webNovelJobById(id)
+                if (current?.status == WebNovelJobState.WAITING_RATE_LIMIT) {
+                    val until = current.waitUntil ?: 0L
+                    _message.value = when {
+                        current.runnerToken != null -> "This conversion is still waiting in the foreground service."
+                        until > System.currentTimeMillis() -> "Retry after ${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(until))}."
+                        else -> null
+                    }
+                    if (current.runnerToken != null || until > System.currentTimeMillis()) return@launch
+                }
+                val job = repository.resumeWebNovelJob(id)
+                if (job == null) _message.value = "This conversion is not ready to resume yet."
+                else WebNovelExportService.start(context, job.id)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not resume this conversion."
+            }
+        }
+    }
+
+    fun resetInvalidWebNovelChapterManifest(id: String) {
+        viewModelScope.launch {
+            try {
+                val job = repository.resetInvalidWebNovelChapterManifest(id)
+                if (job == null) _message.value = "This conversion no longer exists."
+                else WebNovelExportService.start(context, job.id)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not reset the saved chapter list."
+            }
+        }
+    }
+
+    fun hasInvalidSavedChapterManifest(job: WebNovelJobEntity): Boolean =
+        job.status == WebNovelJobState.FAILED &&
+            job.error?.startsWith(WebNovelChapterManifestCodec.INVALID_MANIFEST_ERROR_PREFIX) == true
+
+    fun canResumeWebNovelJob(job: WebNovelJobEntity): Boolean =
+        job.status in setOf(WebNovelJobState.QUEUED, WebNovelJobState.PAUSED, WebNovelJobState.INTERRUPTED, WebNovelJobState.FAILED) ||
+            job.status == WebNovelJobState.WAITING_RATE_LIMIT
+
     private var conversionJob: kotlinx.coroutines.Job? = null
     private val _conversionProgress = MutableStateFlow<Pair<Int, Int>?>(null)
     val conversionProgress = _conversionProgress.asStateFlow()
@@ -303,11 +464,20 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
         libraryId: String = "default"
     ) {
         if (!recoveryAllowsLibraryAction()) return
-        if (downloadProgress.value != null) return
-        try {
-            WebNovelExportService.start(context, url, options, libraryId)
-        } catch (failure: Exception) {
-            _message.value = failure.message ?: "Could not start the background export."
+        viewModelScope.launch {
+            try {
+                val job = repository.enqueueWebNovelConversion(url, options, libraryId)
+                when {
+                    job.status == WebNovelJobState.QUEUED || job.status == WebNovelJobState.RUNNING ->
+                        WebNovelExportService.start(context, job.id)
+                    job.status == WebNovelJobState.COMPLETED -> _message.value = "This website conversion is already in your library."
+                    else -> _message.value = "This conversion is ${job.status.lowercase().replace('_', ' ')}. Open Website conversions to resume or cancel it."
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not queue the background export."
+            }
         }
     }
 

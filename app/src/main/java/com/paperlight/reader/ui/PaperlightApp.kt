@@ -1,6 +1,7 @@
 package com.paperlight.reader.ui
 
 import android.net.Uri
+import android.content.ClipData
 import android.content.Intent
 import androidx.core.content.FileProvider
 import androidx.activity.compose.BackHandler
@@ -65,6 +66,7 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.PictureAsPdf
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -82,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import com.paperlight.reader.data.BookEntity
 import com.paperlight.reader.data.BookRepository
 import com.paperlight.reader.data.PdfEpubMode
+import com.paperlight.reader.data.WebNovelJobState
 import com.paperlight.reader.ui.reader.EpubReaderScreen
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import com.paperlight.reader.webnovel.WebNovelEpubUtility
@@ -158,11 +161,14 @@ private fun PaperlightAppContent(
     val books by viewModel.books.collectAsState()
     val libraries by viewModel.libraries.collectAsState()
     val downloadProgress by viewModel.downloadProgress.collectAsState()
+    val webNovelJobs by viewModel.webNovelJobs.collectAsState()
+    val discoverySources by viewModel.discoverySources.collectAsState()
     val conversionProgress by viewModel.conversionProgress.collectAsState()
     val message by viewModel.message.collectAsState()
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
     var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    var bookDetailsId by rememberSaveable { mutableStateOf<String?>(null) }
     var search by rememberSaveable { mutableStateOf("") }
     var searchVisible by rememberSaveable { mutableStateOf(false) }
     var selectedBooks by remember { mutableStateOf(setOf<String>()) }
@@ -200,7 +206,8 @@ private fun PaperlightAppContent(
     var restorePassword by remember { mutableStateOf("") }
     var restoreReplaceSettings by remember { mutableStateOf(false) }
     var restoreReplaceGroqKey by remember { mutableStateOf(false) }
-    var exportBookId by remember { mutableStateOf<String?>(null) }
+    var exportBookId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showSelectedBookActions by remember { mutableStateOf(false) }
     var showMoreActions by remember { mutableStateOf(false) }
     var showLibraryMenu by remember { mutableStateOf(false) }
     var showCreateLibrary by remember { mutableStateOf(false) }
@@ -208,6 +215,7 @@ private fun PaperlightAppContent(
     var showMoveBooks by remember { mutableStateOf(false) }
     var showDeleteBooks by remember { mutableStateOf(false) }
     var showCreateFromWeb by remember { mutableStateOf(false) }
+    var showWebNovelJobs by rememberSaveable { mutableStateOf(false) }
     var showBookDiscovery by rememberSaveable { mutableStateOf(false) }
     var pendingPdfPath by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingPdfTitle by rememberSaveable { mutableStateOf("") }
@@ -245,40 +253,37 @@ private fun PaperlightAppContent(
         restoreReplaceGroqKey = false
     }
     val exportBook = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        val source = exportBookId?.let { id -> books.firstOrNull { it.id == id } }
+        val sourceId = exportBookId
         val target = result.data?.data?.takeIf { result.resultCode == android.app.Activity.RESULT_OK }
         exportBookId = null
-        if (source != null && target != null) scope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    context.contentResolver.openOutputStream(target, "wt")?.use { output ->
-                        File(source.localPath).inputStream().use { input -> input.copyTo(output) }
-                    } ?: error("Could not write the exported book.")
-                }
-            }.onSuccess { snackbar.showSnackbar("Exported ${source.fileName}.") }
-                .onFailure { snackbar.showSnackbar(it.message ?: "Could not export this book.") }
-        }
+        if (sourceId != null && target != null) viewModel.exportBook(sourceId, target)
     }
     fun shareBook(book: BookEntity) {
         runCatching {
             val file = File(book.localPath)
-            require(file.isFile) { "The original book file is missing." }
+            require(file.isFile && file.canRead()) { "The original book file is missing or unreadable." }
             val contentUri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
-            val mime = when (book.format.uppercase()) {
-                "EPUB" -> "application/epub+zip"
-                "PDF" -> "application/pdf"
-                "TXT" -> "text/plain"
-                "CBZ" -> "application/vnd.comicbook+zip"
-                "CBR" -> "application/vnd.comicbook-rar"
-                "MOBI", "AZW3" -> "application/octet-stream"
-                else -> "application/octet-stream"
-            }
-            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                type = mime
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = bookMimeType(book.format)
                 putExtra(Intent.EXTRA_STREAM, contentUri)
+                clipData = ClipData.newUri(context.contentResolver, book.fileName, contentUri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }, "Share ${book.title}"))
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Share ${book.title} (${book.format})"))
         }.onFailure { scope.launch { snackbar.showSnackbar(it.message ?: "Could not share this book.") } }
+    }
+    fun startBookExport(book: BookEntity) {
+        exportBookId = book.id
+        try {
+            exportBook.launch(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = bookMimeType(book.format)
+                putExtra(Intent.EXTRA_TITLE, book.fileName)
+            })
+        } catch (failure: Exception) {
+            exportBookId = null
+            scope.launch { snackbar.showSnackbar(failure.message ?: "Could not open the export destination picker.") }
+        }
     }
     fun showFileManager(mode: FileManagerMode) {
         scope.launch {
@@ -456,18 +461,19 @@ private fun PaperlightAppContent(
     val title = activeLibrary?.name ?: "All books"
     BackHandler(selectedBooks.isNotEmpty()) { selectedBooks = emptySet() }
     BackHandler(pagerState.currentPage == 1 || fileManagerMode != FileManagerMode.Browse) { returnToLibrary() }
+    BackHandler(showWebNovelJobs) { showWebNovelJobs = false }
     Box(Modifier.fillMaxSize()) {
     HorizontalPager(
         state = pagerState,
-        userScrollEnabled = !drawer.isOpen && fileManagerMode == FileManagerMode.Browse,
+        userScrollEnabled = !showWebNovelJobs && !drawer.isOpen && fileManagerMode == FileManagerMode.Browse,
         beyondViewportPageCount = 1,
-        modifier = Modifier.fillMaxSize().pointerInput(drawer.isOpen, pagerState, fileManagerMode) {
+        modifier = Modifier.fillMaxSize().pointerInput(drawer.isOpen, pagerState, fileManagerMode, showWebNovelJobs) {
             val touchSlop = viewConfiguration.touchSlop
             val menuSwipeDistance = 96.dp.toPx()
             val horizontalRatio = 1.5f
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                if (drawer.isOpen || fileManagerMode != FileManagerMode.Browse || pagerState.currentPage != 0 ||
+                if (showWebNovelJobs || drawer.isOpen || fileManagerMode != FileManagerMode.Browse || pagerState.currentPage != 0 ||
                     pagerState.canScrollBackward || pagerState.isScrollInProgress
                 ) return@awaitEachGesture
 
@@ -521,6 +527,12 @@ private fun PaperlightAppContent(
                 returnToLibrary()
             },
         )
+      } else if (showWebNovelJobs) {
+        WebNovelJobsScreen(
+            jobs = webNovelJobs,
+            viewModel = viewModel,
+            onBack = { showWebNovelJobs = false },
+        )
       } else {
        ModalNavigationDrawer(
         drawerState = drawer,
@@ -563,11 +575,15 @@ private fun PaperlightAppContent(
                 NavigationDrawerItem(label = { Text("Create EPUB from website") }, selected = false,
                     icon = { Icon(Icons.Rounded.Link, null) }, onClick = { showCreateFromWeb = true; scope.launch { drawer.close() } },
                     modifier = Modifier.padding(horizontal = 12.dp))
+                NavigationDrawerItem(label = { Text("Website conversions") }, selected = false,
+                    icon = { Icon(Icons.Rounded.Link, null) }, badge = { Text("${webNovelJobs.count { it.status !in setOf(WebNovelJobState.COMPLETED, WebNovelJobState.CANCELLED) }}") },
+                    onClick = { showWebNovelJobs = true; scope.launch { drawer.close() } },
+                    modifier = Modifier.padding(horizontal = 12.dp))
                 NavigationDrawerItem(label = { Text("Convert PDF to EPUB") }, selected = false,
                     icon = { Icon(Icons.Rounded.PictureAsPdf, null) },
                     onClick = { if (conversionProgress == null) showFileManager(FileManagerMode.ConvertPdf) },
                     modifier = Modifier.padding(horizontal = 12.dp))
-                NavigationDrawerItem(label = { Text("Find books") }, selected = false,
+                NavigationDrawerItem(label = { Text("Discover") }, selected = false,
                     icon = { Icon(Icons.Rounded.Search, null) },
                     onClick = { showBookDiscovery = true; scope.launch { drawer.close() } },
                     modifier = Modifier.padding(horizontal = 12.dp))
@@ -649,23 +665,19 @@ private fun PaperlightAppContent(
                 actions = {
                     if (selectedBooks.isNotEmpty()) {
                         selectedBooks.singleOrNull()?.let { id -> books.firstOrNull { it.id == id } }?.let { selected ->
-                            IconButton(onClick = {
-                                val mime = when (selected.format.uppercase()) {
-                                    "EPUB" -> "application/epub+zip"
-                                    "PDF" -> "application/pdf"
-                                    "TXT" -> "text/plain"
-                                    "CBZ" -> "application/vnd.comicbook+zip"
-                                    "CBR" -> "application/vnd.comicbook-rar"
-                                    else -> "application/octet-stream"
+                            Box {
+                                IconButton(onClick = { showSelectedBookActions = true }) {
+                                    Icon(Icons.Rounded.MoreVert, "Selected book actions")
                                 }
-                                exportBookId = selected.id
-                                exportBook.launch(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                                    addCategory(Intent.CATEGORY_OPENABLE)
-                                    type = mime
-                                    putExtra(Intent.EXTRA_TITLE, selected.fileName)
-                                })
-                            }) { Icon(Icons.Rounded.FileDownload, "Export selected book") }
-                            IconButton(onClick = { shareBook(selected) }) { Icon(Icons.Rounded.Share, "Share selected book") }
+                                DropdownMenu(expanded = showSelectedBookActions, onDismissRequest = { showSelectedBookActions = false }) {
+                                    DropdownMenuItem(text = { Text("Details") }, leadingIcon = { Icon(Icons.Rounded.Info, null) },
+                                        onClick = { showSelectedBookActions = false; bookDetailsId = selected.id })
+                                    DropdownMenuItem(text = { Text("Export") }, leadingIcon = { Icon(Icons.Rounded.FileDownload, null) },
+                                        onClick = { showSelectedBookActions = false; startBookExport(selected) })
+                                    DropdownMenuItem(text = { Text("Share") }, leadingIcon = { Icon(Icons.Rounded.Share, null) },
+                                        onClick = { showSelectedBookActions = false; shareBook(selected) })
+                                }
+                            }
                         }
                         IconButton(onClick = { showMoveBooks = true }) { Icon(Icons.Rounded.DriveFileMove, "Move selected books") }
                         IconButton(onClick = { showDeleteBooks = true }) { Icon(Icons.Rounded.Delete, "Delete selected books") }
@@ -769,7 +781,12 @@ private fun PaperlightAppContent(
                                 Text(progress.label, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
                                 if (progress.total > 0) Text("${progress.completed} / ${progress.total} chapters", style = MaterialTheme.typography.labelSmall)
                             }
-                            IconButton(onClick = viewModel::cancelDownload) { Icon(Icons.Rounded.Close, "Cancel EPUB download") }
+                            if (progress.jobId != null && progress.status in setOf(WebNovelJobState.RUNNING, WebNovelJobState.WAITING_RATE_LIMIT, WebNovelJobState.QUEUED)) {
+                                TextButton(onClick = { viewModel.pauseWebNovelJob(progress.jobId) }) { Text("Pause") }
+                            }
+                            IconButton(onClick = { progress.jobId?.let(viewModel::cancelWebNovelJob) ?: viewModel.cancelDownload() }) {
+                                Icon(Icons.Rounded.Close, "Cancel EPUB download")
+                            }
                         }
                         if (progress.total > 0) LinearProgressIndicator(progress = { progress.completed.toFloat() / progress.total }, modifier = Modifier.fillMaxWidth())
                         else LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -842,9 +859,19 @@ private fun PaperlightAppContent(
     }
 
     if (showBookDiscovery) BookDiscoveryScreen(
+        sources = discoverySources,
+        viewModel = viewModel,
         onDismiss = { showBookDiscovery = false },
         onImportEpub = { file, title, author ->
             viewModel.importDownloadedEpub(file, title, author, activeLibraryId ?: "default")
+        },
+        onConvertWebsite = { url ->
+            showBookDiscovery = false
+            novelUrl = url
+            sampleChapterUrl = ""
+            chapterPreview = null
+            previewError = null
+            showCreateFromWeb = true
         },
     )
     if (pagerState.settledPage == 0) pendingPdfPath?.let { path ->
@@ -1058,6 +1085,29 @@ private fun PaperlightAppContent(
             }) { Text("Restore") } },
             dismissButton = { TextButton(onClick = { pendingRestore = null; restorePassword = ""; restorePasswordVisible = false }) { Text("Cancel") } })
     }
+    bookDetailsId?.let { id -> books.firstOrNull { it.id == id }?.let { book ->
+        AlertDialog(
+            onDismissRequest = { bookDetailsId = null },
+            title = { Text(book.title) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(book.author.ifBlank { "Unknown author" })
+                    Text("Format: ${book.format}")
+                    Text("Filename: ${book.fileName}")
+                    Text("Reading progress: ${(book.progress * 100).toInt()}%")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { bookDetailsId = null; startBookExport(book) }) { Text("Export") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { bookDetailsId = null; shareBook(book) }) { Text("Share") }
+                    TextButton(onClick = { bookDetailsId = null }) { Text("Close") }
+                }
+            },
+        )
+    } }
     opened?.let {
         AlertDialog(
             onDismissRequest = { selectedId = null },
@@ -1345,7 +1395,7 @@ private fun PaperlightAppContent(
                 }
             },
             confirmButton = {
-                TextButton(enabled = downloadProgress == null && canCheckSite && validRange, onClick = {
+                TextButton(enabled = canCheckSite && validRange, onClick = {
                     viewModel.createEpubFromUrl(
                         novelUrl,
                         options,
@@ -1502,4 +1552,13 @@ private fun formatBackupBytes(value: Long): String = when {
     value >= 1024L * 1024L -> "%.1f MB".format(value / (1024.0 * 1024.0))
     value >= 1024L -> "%.0f KB".format(value / 1024.0)
     else -> "$value B"
+}
+
+private fun bookMimeType(format: String): String = when (format.uppercase()) {
+    "EPUB" -> "application/epub+zip"
+    "PDF" -> "application/pdf"
+    "TXT" -> "text/plain"
+    "CBZ" -> "application/vnd.comicbook+zip"
+    "CBR" -> "application/vnd.comicbook-rar"
+    else -> "application/octet-stream"
 }

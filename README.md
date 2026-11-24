@@ -89,25 +89,31 @@ This source snapshot has not been compiled or device-tested in this environment.
 
 ## Build an APK on GitHub
 
-Put this project at the repository root. GitHub Actions runs **Build Android APK**
-when you push a branch. You can also start it from **Actions → Build Android APK →
-Run workflow** once the workflow is on the default branch. After a successful run,
-download **VibeReader-debug** from the run's **Artifacts** section and extract
-`app-debug.apk`.
+GitHub Actions runs debug unit tests and compiles the debug variant on pushes and
+pull requests. It does not upload that debug APK as an installable update.
 
-To produce an APK that can update an existing installation, configure the same
-release keystore used by that installation as GitHub Actions secrets:
-`ANDROID_KEYSTORE_BASE64` (base64-encoded JKS/PKCS12 file),
-`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`.
-The workflow emits a signed release artifact only when all four are configured.
-After comparing the release certificate with a known-good APK, set the optional
-`ANDROID_EXPECTED_CERT_SHA256` secret to its SHA-256 certificate fingerprint; CI
-will reject a release signed by a different certificate. GitHub's workflow run
-number plus 40 supplies `versionCode` (run 1 builds 41); keep this workflow and
-its run history when distributing updates.
-Debug artifacts use the runner's debug signing key and are not a reliable update
-channel. If the original release key is unavailable, Android will reject an
-in-place update signed with a replacement key; export a complete backup before
-any necessary reinstall.
+Trusted direct pushes to main or anthonys1998-Groq can produce a
+Paperlight-update artifact. The workflow signs it with the existing secrets
+ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and
+ANDROID_KEY_PASSWORD, then checks the package ID, version code, and signer
+against the latest artifact baseline before upload. Pull requests and other
+branches never receive the signing secrets. If the signing credentials are
+missing, CI still runs tests and compiles debug, reports that no compatible APK
+was published, and uploads no installable APK. A mismatched signer fails closed.
+
+The latest successful Actions run when this baseline was recorded was run #66.
+Its Paperlight-debug APK had package ID com.paperlight.reader, version code 106,
+and signer SHA-256
+c62965fc3065cd32b7b6f84c2bddbc12f1e667a7951fe298f3882343409419fe
+(Android Debug). The artifact contains the certificate, not its private key.
+An update to that APK requires signing credentials whose private key matches
+that exact certificate; the workflow will not substitute another key.
+
+For a manually requested release, use Actions → Build Android APK → Run
+workflow on main or anthonys1998-Groq and enable Build a signed release APK.
+Supply an explicit versionCode greater than 106. The same pinned certificate
+check applies; there is no user-supplied certificate or version baseline that
+can override it. The temporary keystore file is removed after signing.
+Installing an update on a device has not been verified.
 
 The bundled libmobi 0.12 source is in `app/src/main/cpp/libmobi`. Its license and author notices are included there. The build leaves libmobi’s encryption support disabled.

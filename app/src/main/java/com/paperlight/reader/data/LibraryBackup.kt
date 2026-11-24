@@ -49,17 +49,28 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
     ) = withContext(Dispatchers.IO) {
         require(!includeApiKey || !password.isNullOrBlank()) { "A password is required when including the Groq API key." }
         require(!includeApiKey || requireNotNull(password).length >= 12) { "Use a backup password with at least 12 characters." }
+        check(!dao.hasActiveWebNovelJob()) { "Pause or cancel the active website EPUB job before exporting a backup." }
         val apiKey = if (includeApiKey) requireNotNull(GroqApiKeyStore(context).getKey()) {
             "No Groq API key is saved on this device."
         } else null
         val snapshot = dao.backupSnapshot()
+        val preferences = exportPreferences()
+        val (webNovelExtension, checkpointFiles) = WebNovelBackupCodec.export(
+            dao.allDiscoverySources(), dao.allWebNovelJobs(), File(context.filesDir, CheckpointDirectory),
+            preferences.optJSONObject("webNovelCooldowns"), ensureActive = { coroutineContext.ensureActive() },
+        )
+        val checkpointMetadata = webNovelExtension.getJSONArray("checkpoints")
+        require(checkpointMetadata.length() == checkpointFiles.size) { "Conversion checkpoint metadata is inconsistent." }
         val totalBookBytes = snapshot.first.sumOf { File(it.localPath).length().coerceAtLeast(0L) }
+        val totalPayloadBytes = Math.addExact(totalBookBytes, checkpointFiles.sumOf { it.length().coerceAtLeast(0L) })
+        require(totalPayloadBytes <= MaxBackupBytes) { "Expanded backup exceeds the size limit." }
         var scannedBookBytes = 0L
-        onProgress(BackupProgress(BackupProgressStage.Scanning, 0L, totalBookBytes))
+        onProgress(BackupProgress(BackupProgressStage.Scanning, 0L, totalPayloadBytes))
         val annotations = ReaderAnnotationStore(context)
         val bookmarks = BookmarkStore(context)
         val manifest = JSONObject().put("format", "paperlight-backup").put("version", 2)
-            .put("preferences", exportPreferences())
+            .put("preferences", preferences)
+            .put("extensions", JSONObject().put("webNovel", webNovelExtension))
         apiKey?.let { manifest.put("credentials", JSONObject().put("groqApiKey", it)) }
         manifest.put("libraries", JSONArray().apply {
             snapshot.second.forEach { put(JSONObject().put("id", it.id).put("name", it.name).put("createdAt", it.createdAt)) }
@@ -94,7 +105,7 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                     onProgress(BackupProgress(BackupProgressStage.ProtectingArchive, completed, total))
                 }
             } else {
-                onProgress(BackupProgress(BackupProgressStage.Preparing, 0L, totalBookBytes))
+                onProgress(BackupProgress(BackupProgressStage.Preparing, 0L, totalPayloadBytes))
                 destinationOutput
             }
             ZipOutputStream(zipOutput.buffered()).use { zip ->
@@ -115,7 +126,7 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                             if (count < 0) break
                             zip.write(buffer, 0, count)
                             copiedBookBytes += count
-                            if (apiKey == null) onProgress(BackupProgress(BackupProgressStage.Preparing, copiedBookBytes, totalBookBytes))
+                            if (apiKey == null) onProgress(BackupProgress(BackupProgressStage.Preparing, copiedBookBytes, totalPayloadBytes))
                         }
                     }
                     zip.closeEntry()
@@ -133,6 +144,36 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                         }
                     }
                     zip.closeEntry()
+                }
+                var copiedCheckpointBytes = 0L
+                checkpointFiles.forEachIndexed { index, file ->
+                    coroutineContext.ensureActive()
+                    val record = checkpointMetadata.getJSONObject(index)
+                    val expectedSize = record.getLong("size")
+                    val expectedHash = record.getString("sha256")
+                    require(file.isFile && file.length() == expectedSize) { "A conversion checkpoint changed while the backup was being prepared." }
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    zip.putNextEntry(ZipEntry(record.getString("path")))
+                    var copied = 0L
+                    file.inputStream().buffered().use { input ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            copied = Math.addExact(copied, count.toLong())
+                            require(copied <= expectedSize) { "A conversion checkpoint changed while the backup was being prepared." }
+                            digest.update(buffer, 0, count)
+                            zip.write(buffer, 0, count)
+                            copiedCheckpointBytes += count
+                            if (apiKey == null) onProgress(BackupProgress(BackupProgressStage.Preparing,
+                                totalBookBytes + copiedCheckpointBytes, totalPayloadBytes))
+                        }
+                    }
+                    zip.closeEntry()
+                    require(copied == expectedSize && digest.digest().toHex().equals(expectedHash, true)) {
+                        "A conversion checkpoint changed while the backup was being prepared."
+                    }
                 }
             }
         } ?: error("Could not write the backup file.")
@@ -194,6 +235,20 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                 val manifest = JSONObject(zip.getInputStream(manifestEntry).use { readUtf8Bounded(it, MaxManifestBytes) })
                 val version = manifest.optInt("version")
                 require(manifest.optString("format") == "paperlight-backup" && version in 1..2) { "Unsupported backup format." }
+                val extensionObject = manifest.opt("extensions")
+                require(extensionObject == null || extensionObject is JSONObject) { "Invalid backup extensions." }
+                val webNovelObject = (extensionObject as? JSONObject)?.opt("webNovel")
+                require(webNovelObject == null || webNovelObject is JSONObject) { "Invalid website backup extension." }
+                val webNovelPayload = (webNovelObject as? JSONObject)?.let(WebNovelBackupCodec::parse)
+                val listedCheckpointPaths = webNovelPayload?.checkpointFiles?.map { it.archivePath }?.toSet().orEmpty()
+                val archiveCheckpointPaths = seenEntries.filter { it.startsWith("checkpoints/") }.toSet()
+                require(archiveCheckpointPaths == listedCheckpointPaths) {
+                    "The archive checkpoint files do not match its integrity manifest."
+                }
+                webNovelPayload?.checkpointFiles?.forEach { record ->
+                    val entry = requireNotNull(zip.getEntry(record.archivePath)) { "A conversion checkpoint is missing from the backup." }
+                    require(entry.size == record.size) { "A conversion checkpoint has an invalid size." }
+                }
 
                 val credentials = manifest.optJSONObject("credentials")
                 require(credentials == null || encryptedBackup) { "Backups containing credentials must be password encrypted." }
@@ -213,10 +268,10 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
 
                 val bookArray = manifest.getJSONArray("books")
                 require(bookArray.length() <= MaxBooks) { "Too many books in this backup." }
-                val validationTotal = (0 until bookArray.length()).sumOf { index ->
+                val validationTotal = Math.addExact((0 until bookArray.length()).sumOf { index ->
                     val id = bookArray.getJSONObject(index).optString("id")
                     zip.getEntry("books/$id")?.size?.coerceAtLeast(0L) ?: 0L
-                }
+                }, webNovelPayload?.checkpointBytes ?: 0L)
                 val existing = dao.allBooks().map { it.id }.toSet()
                 val seen = mutableSetOf<String>()
                 val validatedBooks = ArrayList<ValidatedRestoreBook>(bookArray.length())
@@ -284,6 +339,8 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                         rawLibraryId, content, expectedSha256, annotations, bookmarks
                     )
                 }
+                estimatedBytes = Math.addExact(estimatedBytes, webNovelPayload?.checkpointBytes ?: 0L)
+                require(estimatedBytes <= MaxBackupBytes) { "Expanded backup exceeds the size limit." }
                 val freeBytes = StatFs(context.filesDir.path).availableBytes
                 require(estimatedBytes <= (freeBytes - MinRestoreFreeBytes).coerceAtLeast(0L)) {
                     "There is not enough free storage to safely stage this restore."
@@ -313,7 +370,8 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                 val restoredBooks = ArrayList<BookEntity>(planned.size)
                 val restoredStates = JSONArray()
                 var expanded = 0L
-                val stagingTotal = planned.sumOf { it.contentEntry.size.coerceAtLeast(0L) }
+                val stagingTotal = Math.addExact(planned.sumOf { it.contentEntry.size.coerceAtLeast(0L) },
+                    webNovelPayload?.checkpointBytes ?: 0L)
                 onProgress(BackupProgress(BackupProgressStage.Staging, 0L, stagingTotal))
                 for (item in planned) {
                     coroutineContext.ensureActive()
@@ -353,8 +411,87 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                         .put("bookmarks", bookmarksToJson(item.bookmarks)))
                 }
 
+                val stagedCheckpointRoot = File(transactionDir, "checkpoint-stage")
+                webNovelPayload?.let { payload ->
+                    var checkpointBytesCopied = 0L
+                    for (record in payload.checkpointFiles) {
+                        coroutineContext.ensureActive()
+                        val entry = requireNotNull(zip.getEntry(record.archivePath))
+                        val parent = File(stagedCheckpointRoot, record.key)
+                        check(parent.isDirectory || parent.mkdirs()) { "Could not stage conversion checkpoint storage." }
+                        val stagedFile = File(parent, record.name)
+                        val digest = MessageDigest.getInstance("SHA-256")
+                        zip.getInputStream(entry).use { input ->
+                            stagedFile.outputStream().buffered().use { output ->
+                                val buffer = ByteArray(64 * 1024)
+                                var fileBytes = 0L
+                                while (true) {
+                                    coroutineContext.ensureActive()
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    fileBytes = Math.addExact(fileBytes, count.toLong())
+                                    checkpointBytesCopied = Math.addExact(checkpointBytesCopied, count.toLong())
+                                    require(fileBytes <= record.size && Math.addExact(expandedBytes, checkpointBytesCopied) <= MaxBackupBytes) {
+                                        "Expanded backup exceeds the size limit."
+                                    }
+                                    digest.update(buffer, 0, count)
+                                    output.write(buffer, 0, count)
+                                    onProgress(BackupProgress(BackupProgressStage.Staging,
+                                        planned.sumOf { it.contentEntry.size.coerceAtLeast(0L) } + checkpointBytesCopied, stagingTotal))
+                                }
+                                require(fileBytes == record.size && digest.digest().toHex().equals(record.sha256, true)) {
+                                    "A saved conversion checkpoint failed its integrity check."
+                                }
+                            }
+                        }
+                    }
+                    WebNovelBackupCodec.validateStagedCheckpoints(payload, stagedCheckpointRoot) {
+                        coroutineContext.ensureActive()
+                    }
+                }
+                val stagedExtensionFile = webNovelPayload?.let { payload ->
+                    File(transactionDir, WebNovelExtensionFile).also { file ->
+                        val bytes = payload.extension.toString().toByteArray(Charsets.UTF_8)
+                        require(bytes.size <= MaxManifestBytes) { "The website backup extension is too large." }
+                        file.writeBytes(bytes)
+                    }
+                }
+                val checkpointRoot = File(context.filesDir, CheckpointDirectory)
+                val publicationPlan = webNovelPayload?.let { payload ->
+                    WebNovelBackupCodec.planCheckpointPublication(payload, checkpointRoot) { coroutineContext.ensureActive() }
+                } ?: WebNovelBackupPublishPlan(emptyList(), emptySet())
+                val existingJobIds = dao.allWebNovelJobs().mapTo(mutableSetOf()) { it.id }
+                val importedJobIds = webNovelPayload?.jobs.orEmpty().filterNot { it.id in existingJobIds }.map { it.id }
+                val existingLibraryIds = (dao.allLibraries().map { it.id } + libraries.map { it.id } + "default").toSet()
+                val restoredJobs = webNovelPayload?.jobs.orEmpty().filterNot { it.id in existingJobIds }.map { job ->
+                    val safeJob = job.copy(libraryId = job.libraryId.takeIf { it in existingLibraryIds } ?: "default")
+                    if (safeJob.checkpointKey in publicationPlan.conflictingKeys &&
+                        safeJob.status !in setOf(WebNovelJobState.COMPLETED, WebNovelJobState.CANCELLED)) {
+                        val reason = "${com.paperlight.reader.webnovel.WebNovelChapterManifestCodec.INVALID_MANIFEST_ERROR_PREFIX} A checkpoint with this key already exists on this device. Reset the chapter list before retrying."
+                        safeJob.copy(status = WebNovelJobState.FAILED, completed = 0, total = 0,
+                            label = "Restored checkpoint conflict", error = reason, waitUntil = null,
+                            runnerToken = null, runnerType = null, autoRun = false)
+                    } else safeJob
+                }
+                val backupCooldowns = cooldownsFromPreferenceSnapshot(
+                    manifest.optJSONObject("preferences")?.optJSONObject("webNovelCooldowns"),
+                    webNovelPayload?.capturedAt ?: System.currentTimeMillis(),
+                ).toMutableMap().apply {
+                    webNovelPayload?.cooldowns?.forEach { (host, waitUntil) ->
+                        this[host] = maxOf(this[host] ?: 0L, waitUntil)
+                    }
+                }
+                val ownedCheckpointFiles = JSONArray().apply {
+                    publicationPlan.filesToPublish.forEach { record -> put(checkpointRecordToJson(record)) }
+                }
+                val cooldownRecords = JSONArray().apply {
+                    backupCooldowns.toSortedMap().forEach { (host, waitUntil) ->
+                        put(JSONObject().put("host", host).put("waitUntil", waitUntil))
+                    }
+                }
+
                 val journal = JSONObject()
-                    .put("journalVersion", 2)
+                    .put("journalVersion", 3)
                     .put("transactionId", transactionId)
                     .put("committed", false)
                     .put("bookIds", JSONArray(restoredBooks.map { it.id }))
@@ -366,6 +503,12 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                     .put("fontIncluded", stagedFont != null)
                     .put("applyFont", applyFont)
                     .put("fontSha256", if (stagedFont != null) sha256(stagedFont) else "")
+                    .put("ownedCheckpointFiles", ownedCheckpointFiles)
+                    .put("skippedCheckpointKeys", JSONArray(publicationPlan.conflictingKeys))
+                    .put("webNovelJobIds", JSONArray(importedJobIds))
+                    .put("webNovelCooldowns", cooldownRecords)
+                    .put("webNovelExtensionSize", stagedExtensionFile?.length() ?: JSONObject.NULL)
+                    .put("webNovelExtensionSha256", stagedExtensionFile?.let { sha256(it) } ?: JSONObject.NULL)
                 writeRestoreJournal(journal)
                 journalWritten = true
 
@@ -379,13 +522,27 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                     moveAtomically(stagedFile, destination)
                     onProgress(BackupProgress(BackupProgressStage.Publishing, index + 1L, restoredBooks.size.toLong(), BackupProgressUnit.Books))
                 }
-                dao.restoreSnapshot(libraries, restoredBooks)
+                publicationPlan.filesToPublish.forEach { record ->
+                    coroutineContext.ensureActive()
+                    val stagedFile = checkpointFile(stagedCheckpointRoot, record.key, record.name)
+                    val targetDirectory = File(checkpointRoot, record.key)
+                    check(targetDirectory.isDirectory || targetDirectory.mkdirs()) { "Could not publish conversion checkpoints." }
+                    check(targetDirectory.canonicalFile.parentFile == checkpointRoot.canonicalFile &&
+                        !java.nio.file.Files.isSymbolicLink(targetDirectory.toPath())) { "Unsafe conversion checkpoint destination." }
+                    moveAtomicallyNoReplace(stagedFile, checkpointFile(checkpointRoot, record.key, record.name))
+                }
+                dao.restoreExtendedSnapshot(
+                    libraries, restoredBooks, restoredJobs, webNovelPayload?.sources.orEmpty(),
+                    webNovelPayload?.builtinEnabled.orEmpty(), replaceExistingSettings,
+                    transactionId, System.currentTimeMillis(),
+                )
                 committed = true
                 journal.put("committed", true)
                 writeRestoreJournal(journal)
                 onProgress(BackupProgress(BackupProgressStage.Finalizing))
                 finishRestoreJournal(journal)
                 check(!restoreJournalFile().exists() || restoreJournalFile().delete()) { "Could not clear the completed restore journal." }
+                dao.deleteRestoreTransaction(transactionId)
                 transactionDir.deleteRecursively()
                 restoredBooks.size
             }
@@ -400,7 +557,8 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                         val bookIds = List(ids.length()) { ids.getString(it) }
                         val persisted = dao.allBooks().mapTo(mutableSetOf()) { it.id }
                         persistedIds = persisted
-                        bookIds.isEmpty() || bookIds.all { it in persisted }
+                        if (journal.optInt("journalVersion") >= 3) dao.hasRestoreTransaction(transactionId)
+                        else bookIds.isEmpty() || bookIds.all { it in persisted }
                     }
                 } catch (_: Exception) {
                     // The database outcome is ambiguous. Keep both the journal and published files
@@ -421,6 +579,17 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                                     val file = File(booksDirectory, "$id.$extension")
                                     check(!file.exists() || file.delete()) { "Could not roll back a staged book file." }
                                 }
+                            }
+                        }
+                        val ownedCheckpointFiles = journal.optJSONArray("ownedCheckpointFiles") ?: JSONArray()
+                        repeat(ownedCheckpointFiles.length()) { index ->
+                            val record = checkpointRecordFromJson(ownedCheckpointFiles.getJSONObject(index))
+                            val file = checkpointFile(File(context.filesDir, CheckpointDirectory), record.key, record.name)
+                            if (file.exists()) {
+                                check(file.isFile && file.length() == record.size && sha256(file).equals(record.sha256, true)) {
+                                    "A rollback checkpoint file no longer matches this restore transaction."
+                                }
+                                check(file.delete()) { "Could not roll back a published conversion checkpoint." }
                             }
                         }
                         check(transactionDir.deleteRecursively() || !transactionDir.exists()) { "Could not remove staged restore data." }
@@ -448,6 +617,7 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
             File(context.filesDir, "$RestoreJournal.tmp").delete()
             File(context.filesDir, RestoreDirectory).listFiles()?.forEach { it.deleteRecursively() }
             context.cacheDir.listFiles()?.filter { it.name.startsWith("restore-") }?.forEach { it.deleteRecursively() }
+            dao.clearRestoreTransactions()
             return@withContext
         }
         val journal = try {
@@ -456,9 +626,12 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
             throw BackupRestoreRecoveryException("Restore recovery journal is unreadable. Do not modify the library until it is repaired.", failure)
         }
         try {
-            if (journal.optInt("journalVersion") < 2) {
+            val journalVersion = journal.optInt("journalVersion")
+            var committedMarkerId: String? = null
+            var v3TransactionDirectory: File? = null
+            if (journalVersion < 2) {
                 recoverLegacyJournal(journal)
-            } else {
+            } else if (journalVersion == 2) {
                 val transactionId = journal.getString("transactionId")
                 require(transactionId.matches(Regex("[a-fA-F0-9-]{36}"))) { "Invalid restore transaction identifier." }
                 val ids = journal.optJSONArray("bookIds")?.let { array -> List(array.length()) { array.getString(it) } }.orEmpty()
@@ -479,8 +652,44 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                     }
                 }
                 transactionDirectory(transactionId).deleteRecursively()
+            } else if (journalVersion == 3) {
+                val transactionId = journal.getString("transactionId")
+                require(transactionId.matches(Regex("[a-fA-F0-9-]{36}"))) { "Invalid restore transaction identifier." }
+                v3TransactionDirectory = transactionDirectory(transactionId)
+                val ids = journal.optJSONArray("bookIds")?.let { array -> List(array.length()) { array.getString(it) } }.orEmpty()
+                require(ids.distinct().size == ids.size && ids.all { it.matches(Regex("[a-zA-Z0-9-]{1,80}")) }) {
+                    "Invalid identifiers in restore journal."
+                }
+                if (dao.hasRestoreTransaction(transactionId)) {
+                    finishRestoreJournal(journal)
+                    committedMarkerId = transactionId
+                } else {
+                    val presentIds = dao.allBooks().mapTo(mutableSetOf()) { it.id }
+                    val booksDirectory = File(context.filesDir, "books")
+                    ids.filterNot { it in presentIds }.forEach { id ->
+                        SupportedBookFormats.forEach { extension ->
+                            val file = File(booksDirectory, "$id.$extension")
+                            check(!file.exists() || file.delete()) { "Could not remove an uncommitted restored book file." }
+                        }
+                    }
+                    val owned = journal.optJSONArray("ownedCheckpointFiles") ?: JSONArray()
+                    repeat(owned.length()) { index ->
+                        val record = checkpointRecordFromJson(owned.getJSONObject(index))
+                        val file = checkpointFile(File(context.filesDir, CheckpointDirectory), record.key, record.name)
+                        if (file.exists()) {
+                            check(file.isFile && file.length() == record.size && sha256(file).equals(record.sha256, true)) {
+                                "An uncommitted checkpoint no longer matches its restore journal."
+                            }
+                            check(file.delete()) { "Could not remove an uncommitted conversion checkpoint." }
+                        }
+                    }
+                }
+            } else {
+                error("Unsupported restore recovery journal version.")
             }
             check(!journalFile.exists() || journalFile.delete()) { "Could not clear the completed restore journal." }
+            committedMarkerId?.let { dao.deleteRestoreTransaction(it) }
+            v3TransactionDirectory?.deleteRecursively()
             File(context.filesDir, RestoreDirectory).listFiles()?.forEach { it.deleteRecursively() }
             context.cacheDir.listFiles()?.filter { it.name.startsWith("restore-") }?.forEach { it.deleteRecursively() }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -517,7 +726,8 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
     private suspend fun finishRestoreJournal(journal: JSONObject) {
         val transactionId = journal.getString("transactionId")
         val transactionDir = transactionDirectory(transactionId)
-        require(journal.optInt("journalVersion") == 2) { "Unsupported restore journal version." }
+        val journalVersion = journal.optInt("journalVersion")
+        require(journalVersion in 2..3) { "Unsupported restore journal version." }
         val ids = journal.optJSONArray("bookIds")?.let { array -> List(array.length()) { array.getString(it) } }.orEmpty()
         require(ids.distinct().size == ids.size && ids.all { it.matches(Regex("[a-zA-Z0-9-]{1,80}")) }) {
             "Invalid book identifiers in restore journal."
@@ -556,10 +766,57 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
                 validateFont(targetFont)
             }
         }
+        val importedJobIds = journal.optJSONArray("webNovelJobIds")?.let { array ->
+            List(array.length()) { array.getString(it) }
+        }.orEmpty()
+        require(importedJobIds.distinct().size == importedJobIds.size &&
+            importedJobIds.all { it.matches(Regex("[a-zA-Z0-9-]{1,80}")) }) { "Invalid conversion identifiers in restore journal." }
+        val previousCooldowns = if (journalVersion >= 2) currentCooldowns() else emptyMap()
+        val savedCooldowns = if (journalVersion >= 2) parseJournalCooldowns(
+            journal.optJSONArray("webNovelCooldowns") ?: JSONArray(),
+        ).toMutableMap().apply {
+            cooldownsFromPreferenceSnapshot(journal.optJSONObject("settings")?.optJSONObject("webNovelCooldowns"),
+                System.currentTimeMillis()).forEach { (host, waitUntil) ->
+                this[host] = maxOf(this[host] ?: 0L, waitUntil)
+            }
+        } else emptyMap()
+        if (journalVersion >= 3) {
+            val extensionSizeValue = journal.opt("webNovelExtensionSize")
+            if (extensionSizeValue != null && extensionSizeValue != JSONObject.NULL) {
+                val extensionSize = (extensionSizeValue as? Number)?.toLong()
+                    ?: error("Invalid website extension size in restore journal.")
+                val extensionHash = journal.optString("webNovelExtensionSha256")
+                val extensionFile = File(transactionDir, WebNovelExtensionFile)
+                try {
+                    require(extensionSize in 1..MaxManifestBytes && extensionFile.isFile && extensionFile.length() == extensionSize &&
+                        extensionHash.matches(Regex("[a-fA-F0-9]{64}")) && sha256(extensionFile).equals(extensionHash, true)) {
+                        "The staged website backup extension is missing or corrupt."
+                    }
+                    val payload = WebNovelBackupCodec.parse(JSONObject(extensionFile.inputStream().use {
+                        readUtf8Bounded(it, MaxManifestBytes)
+                    }))
+                    val skippedKeys = journal.optJSONArray("skippedCheckpointKeys")?.let { array ->
+                        List(array.length()) { array.getString(it) }.onEach {
+                            require(it.matches(Regex("[0-9a-f]{64}"))) { "Invalid skipped checkpoint key." }
+                        }.toSet()
+                    }.orEmpty()
+                    WebNovelBackupCodec.validatePublishedCheckpoints(payload, File(context.filesDir, CheckpointDirectory), skippedKeys) {
+                        coroutineContext.ensureActive()
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    markImportedJobsForCheckpointReset(importedJobIds)
+                }
+            } else if (importedJobIds.isNotEmpty()) {
+                markImportedJobsForCheckpointReset(importedJobIds)
+            }
+        }
         // Replaying library insertion is idempotent and also completes a zero-book restore whose
         // Room transaction may have been interrupted before its post-transaction journal update.
         dao.restoreSnapshot(journalLibraries, emptyList())
         restorePreferences(journal.optJSONObject("settings"), journal.optBoolean("replaceSettings"))
+        if (journalVersion >= 2) persistMaximumCooldowns(previousCooldowns, savedCooldowns)
         encryptedKey?.let { GroqApiKeyStore(context).restoreEncryptedValue(it) }
         for ((id, annotations, bookmarks) in parsedStates) {
             check(ReaderAnnotationStore(context).writeAndCommit(id, annotations)) {
@@ -686,6 +943,119 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
         return File(File(context.filesDir, RestoreDirectory), id)
     }
 
+    private fun checkpointRecordToJson(record: WebNovelBackupCheckpointFile) = JSONObject()
+        .put("key", record.key).put("name", record.name).put("path", record.archivePath)
+        .put("size", record.size).put("sha256", record.sha256)
+
+    private fun checkpointRecordFromJson(item: JSONObject): WebNovelBackupCheckpointFile {
+        val key = item.getString("key")
+        val name = item.getString("name")
+        val path = item.getString("path")
+        val size = item.getLong("size")
+        val hash = item.getString("sha256")
+        val nameIsValid = name == "chapter-manifest.json" || name.matches(Regex("chapter-[0-9]{5}\\.(xhtml|url)"))
+        val maximum = when {
+            name == "chapter-manifest.json" -> com.paperlight.reader.webnovel.WebNovelChapterManifestCodec.MAX_SERIALIZED_BYTES.toLong()
+            name.endsWith(".url") -> MaxCheckpointUrlBytes.toLong()
+            else -> WebNovelBackupCodec.MAX_CHAPTER_BYTES
+        }
+        require(key.matches(Regex("[0-9a-f]{64}")) && nameIsValid && path == "checkpoints/$key/$name" &&
+            size in 1..maximum && hash.matches(Regex("[a-fA-F0-9]{64}"))) { "Invalid checkpoint ownership in restore journal." }
+        return WebNovelBackupCheckpointFile(key, name, path, size, hash.lowercase(java.util.Locale.ROOT))
+    }
+
+    private fun checkpointFile(root: File, key: String, name: String): File {
+        require(key.matches(Regex("[0-9a-f]{64}"))) { "Unsafe conversion checkpoint path." }
+        val rootParent = root.absoluteFile.parentFile ?: error("Unsafe conversion checkpoint root.")
+        require(!java.nio.file.Files.isSymbolicLink(root.toPath()) && root.canonicalFile.parentFile == rootParent.canonicalFile &&
+            (!root.exists() || root.isDirectory)) { "Unsafe conversion checkpoint root." }
+        val validName = name == "chapter-manifest.json" || name.matches(Regex("chapter-[0-9]{5}\\.(xhtml|url)"))
+        require(validName) { "Unsafe conversion checkpoint path." }
+        val directory = File(root, key)
+        require(!directory.exists() || (directory.isDirectory && !java.nio.file.Files.isSymbolicLink(directory.toPath()))) {
+            "Unsafe conversion checkpoint path."
+        }
+        val file = File(directory, name)
+        require(file.canonicalFile.parentFile == directory.canonicalFile && directory.canonicalFile.parentFile == root.canonicalFile) {
+            "Unsafe conversion checkpoint path."
+        }
+        return file
+    }
+
+    private fun moveAtomicallyNoReplace(source: File, destination: File) {
+        destination.parentFile?.let { check(it.isDirectory || it.mkdirs()) { "Could not create a checkpoint destination." } }
+        check(!destination.exists()) { "A conversion checkpoint already exists and will not be overwritten." }
+        java.nio.file.Files.move(source.toPath(), destination.toPath())
+    }
+
+    private fun parseJournalCooldowns(items: JSONArray): Map<String, Long> {
+        require(items.length() <= 4_096) { "Too many website cooldown records in restore journal." }
+        val result = linkedMapOf<String, Long>()
+        val maximum = Math.addExact(System.currentTimeMillis(), MaxCooldownDelayMillis)
+        repeat(items.length()) { index ->
+            val item = items.getJSONObject(index)
+            val host = validatedCooldownHost(item.getString("host"))
+            val waitUntil = item.getLong("waitUntil")
+            require(waitUntil in 0..maximum && result.put(host, waitUntil) == null) { "Invalid website cooldown in restore journal." }
+        }
+        return result
+    }
+
+    private fun cooldownsFromPreferenceSnapshot(snapshot: JSONObject?, capturedAt: Long): Map<String, Long> {
+        if (snapshot == null) return emptyMap()
+        require(snapshot.length() <= 4_096) { "Too many website cooldown records in this backup." }
+        val maximum = Math.addExact(capturedAt, MaxCooldownDelayMillis)
+        val result = linkedMapOf<String, Long>()
+        for (index in 0 until snapshot.length()) {
+            val rawHost = snapshot.names()?.optString(index) ?: continue
+            val host = validatedCooldownHost(rawHost)
+            val item = snapshot.getJSONObject(rawHost)
+            require(item.optString("type") in setOf("long", "int")) { "Invalid website cooldown preference." }
+            val waitUntil = (item.opt("value") as? Number)?.toLong() ?: error("Invalid website cooldown deadline.")
+            require(waitUntil in 0..maximum && result.put(host, waitUntil) == null) { "Invalid website cooldown deadline." }
+        }
+        return result
+    }
+
+    private fun currentCooldowns(): Map<String, Long> = context.getSharedPreferences("webNovelCooldowns", Context.MODE_PRIVATE)
+        .all.mapNotNull { (rawHost, value) ->
+            val host = runCatching { validatedCooldownHost(rawHost) }.getOrNull()
+            val deadline = (value as? Number)?.toLong()
+            if (host != null && deadline != null && deadline >= 0L) host to deadline else null
+        }.toMap()
+
+    private fun validatedCooldownHost(raw: String): String {
+        require(raw.length in 1..255 && raw.none { it.isWhitespace() || it in "/?#@\\" }) { "Invalid website cooldown host." }
+        val uri = java.net.URI("https://$raw")
+        val host = uri.host ?: error("Invalid website cooldown host.")
+        require(uri.userInfo == null && uri.port == -1 && uri.path.isNullOrEmpty() && host.equals(raw, true)) {
+            "Invalid website cooldown host."
+        }
+        return host.lowercase(java.util.Locale.ROOT)
+    }
+
+    private fun persistMaximumCooldowns(previous: Map<String, Long>, incoming: Map<String, Long>) {
+        val preferences = context.getSharedPreferences("webNovelCooldowns", Context.MODE_PRIVATE)
+        val editor = preferences.edit()
+        (previous.keys + incoming.keys).forEach { host ->
+            val deadline = maxOf(previous[host] ?: 0L, incoming[host] ?: 0L)
+            if (deadline > 0L) editor.putLong(host, deadline) else editor.remove(host)
+        }
+        check(editor.commit()) { "Could not restore website cooldown preferences." }
+    }
+
+    private suspend fun markImportedJobsForCheckpointReset(ids: List<String>) {
+        val error = "${com.paperlight.reader.webnovel.WebNovelChapterManifestCodec.INVALID_MANIFEST_ERROR_PREFIX} A restored checkpoint is missing or corrupt. Reset the chapter list before retrying."
+        ids.forEach { id ->
+            val job = dao.webNovelJobById(id) ?: return@forEach
+            if (job.status !in setOf(WebNovelJobState.COMPLETED, WebNovelJobState.CANCELLED)) {
+                dao.updateWebNovelJob(job.copy(status = WebNovelJobState.FAILED, completed = 0, total = 0,
+                    label = "Restored checkpoint needs reset", error = error, waitUntil = null,
+                    runnerToken = null, runnerType = null, autoRun = false, updatedAt = System.currentTimeMillis()))
+            }
+        }
+    }
+
     private fun writeRestoreJournal(value: JSONObject) {
         val temporary = File(context.filesDir, "$RestoreJournal.tmp")
         val bytes = value.toString().toByteArray(Charsets.UTF_8)
@@ -790,11 +1160,15 @@ internal class LibraryBackup(private val context: Context, private val dao: Book
     private companion object {
         const val RestoreDirectory = "backup-restore-pending"
         const val RestoreJournal = "backup-restore-journal.json"
+        const val CheckpointDirectory = "webnovel-checkpoints"
+        const val WebNovelExtensionFile = "webnovel-extension.json"
         const val MaxBooks = 10_000
         const val MaxLibraries = 1_000
-        const val MaxBackupEntries = 10_002
+        const val MaxBackupEntries = WebNovelBackupCodec.MAX_ARCHIVE_ENTRIES
         const val MaxFontBytes = 6L * 1024 * 1024
         const val MaxJournalBytes = 20L * 1024 * 1024
+        const val MaxCheckpointUrlBytes = 16_000
+        const val MaxCooldownDelayMillis = 7L * 24 * 60 * 60 * 1_000
         const val MinRestoreFreeBytes = 16L * 1024 * 1024
         val BackupPreferenceNames = listOf(
             "accessibility", "reader", "libraryAppearance", "groqModels", "readingStatistics", "noteSummaries", "webNovelCooldowns"

@@ -16,7 +16,11 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import kotlin.coroutines.resume
 
-internal class RenderedNovelPage(private val context: Context) {
+internal class RenderedNovelPage(
+    private val context: Context,
+    private val maxSnapshotBytes: Int? = null,
+) {
+    init { require(maxSnapshotBytes == null || maxSnapshotBytes in 1..MAX_SNAPSHOT_CHARS) }
     suspend fun load(url: String, ready: (Document) -> Boolean): Document =
         withContext(Dispatchers.Main) {
             val browser = WebView(context.applicationContext)
@@ -60,8 +64,13 @@ internal class RenderedNovelPage(private val context: Context) {
                         if (finished) {
                             val snapshot = browser.snapshot()
                             if (snapshot != null) {
+                                if (snapshot.optBoolean("tooLarge")) error("Rendered page exceeds the size limit.")
                                 val rendered = withContext(Dispatchers.Default) {
-                                    val document = Jsoup.parse(snapshot.getString("html"), snapshot.getString("url"))
+                                    val html = snapshot.getString("html")
+                                    if (maxSnapshotBytes != null) require(html.toByteArray(Charsets.UTF_8).size <= maxSnapshotBytes) {
+                                        "Rendered page exceeds the size limit."
+                                    }
+                                    val document = Jsoup.parse(html, snapshot.getString("url"))
                                     document to ready(document)
                                 }
                                 lastTitle = rendered.first.title().take(120)
@@ -82,18 +91,17 @@ internal class RenderedNovelPage(private val context: Context) {
 
     private suspend fun WebView.snapshot(): JSONObject? =
         suspendCancellableCoroutine { continuation ->
-            evaluateJavascript(
-                """
-                (() => {
-                    const html = document.documentElement?.outerHTML;
-                    if (!html || html.length > 8000000) return null;
-                    return {url: location.href, html};
-                })()
-                """.trimIndent()
-            ) { result ->
+            val script = "(function(){var html=document.documentElement&&document.documentElement.outerHTML;" +
+                "if(!html)return null;if(html.length>" + (maxSnapshotBytes ?: MAX_SNAPSHOT_CHARS) +
+                ")return {url:location.href,tooLarge:true};return {url:location.href,html:html};})()"
+            evaluateJavascript(script) { result ->
                 if (continuation.isActive) {
                     continuation.resume(result?.let { runCatching { JSONObject(it) }.getOrNull() })
                 }
             }
         }
+
+    private companion object {
+        const val MAX_SNAPSHOT_CHARS = 8_000_000
+    }
 }

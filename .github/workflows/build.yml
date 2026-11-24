@@ -2,10 +2,28 @@ name: Build Android APK
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
+    inputs:
+      build_release:
+        description: Build a signed release APK after checks
+        required: false
+        type: boolean
+        default: false
+      release_version_code:
+        description: Explicit versionCode for this release
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
+
+# Fixed compatibility baseline from the latest published Actions APK. Keep the
+# signer pin fail-closed until the APK certificate and matching key are verified.
+env:
+  UPDATE_BASELINE_VERSION_CODE: '106'
+  UPDATE_BASELINE_CERT_SHA256: 'c62965fc3065cd32b7b6f84c2bddbc12f1e667a7951fe298f3882343409419fe'
 
 jobs:
   debug-apk:
@@ -67,47 +85,117 @@ jobs:
             app/build/test-results/
           if-no-files-found: ignore
 
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Paperlight-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
-      - name: Build consistently signed release APK when signing secrets are configured
+      - name: Build and verify compatible update APK
+        id: compatible_update
+        if: >-
+          (github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/anthonys1998-Groq')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.build_release &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/anthonys1998-Groq'))
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          RELEASE_VERSION_CODE: ${{ inputs.release_version_code }}
         run: |
-          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
-            echo "::warning::Release signing secrets are not configured. Only a debug APK was built; it may not update an existing installation. Configure the original signing key before distributing update APKs."
-            exit 0
-          fi
-          trap 'rm -f "$RUNNER_TEMP/vibe-reader-release.jks"' EXIT
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/vibe-reader-release.jks"
-          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/vibe-reader-release.jks"
-          gradle :app:assembleRelease -PappVersionCode=$((GITHUB_RUN_NUMBER + 40)) --stacktrace
-
-      - name: Verify release APK signature
-        if: ${{ hashFiles('app/build/outputs/apk/release/app-release.apk') != '' }}
-        env:
-          ANDROID_EXPECTED_CERT_SHA256: ${{ secrets.ANDROID_EXPECTED_CERT_SHA256 }}
-        run: |
-          APK="app/build/outputs/apk/release/app-release.apk"
-          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
-          "$APKSIGNER" verify --verbose --print-certs "$APK"
-          if [ -n "$ANDROID_EXPECTED_CERT_SHA256" ]; then
-            actual=$("$APKSIGNER" verify --print-certs "$APK" | awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
-            expected=$(printf '%s' "$ANDROID_EXPECTED_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
-            test -n "$actual" && test "$actual" = "$expected" || { echo "::error::Release APK certificate does not match ANDROID_EXPECTED_CERT_SHA256"; exit 1; }
+          set -euo pipefail
+          set +x
+          is_push=false
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then is_push=true; fi
+          missing=()
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then missing+=("$name"); fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            if [[ "$is_push" == true ]]; then
+              echo "::warning::Compatible update APK skipped: original signing credentials are not configured."
+              echo "No installable APK was published. Tests and debug compilation still ran." >> "$GITHUB_STEP_SUMMARY"
+              echo "built=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::An explicit release requires all four existing signing secrets: ${missing[*]}."
+            exit 1
           fi
 
-      - name: Upload release APK
-        if: ${{ hashFiles('app/build/outputs/apk/release/app-release.apk') != '' }}
+          expected_cert=$(printf '%s' "$UPDATE_BASELINE_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if ! [[ "$expected_cert" =~ ^[0-9a-f]{64}$ ]]; then
+            if [[ "$is_push" == true ]]; then
+              echo "::warning::Compatible update APK skipped: the verified baseline certificate pin is not configured."
+              echo "No installable APK was published. The signer pin must be verified against the latest Actions artifact first." >> "$GITHUB_STEP_SUMMARY"
+              echo "built=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::Explicit release is blocked until the latest artifact signer is pinned."
+            exit 1
+          fi
+
+          if [[ "$is_push" == true ]]; then
+            release_version_code=$((GITHUB_RUN_NUMBER + 40))
+          else
+            release_version_code="$RELEASE_VERSION_CODE"
+          fi
+          export RELEASE_VERSION_CODE="$release_version_code"
+          if ! python3 - <<'PY'
+          import os, re, sys
+          raw = os.environ.get("RELEASE_VERSION_CODE", "")
+          baseline = int(os.environ["UPDATE_BASELINE_VERSION_CODE"])
+          if not re.fullmatch(r"[1-9][0-9]*", raw):
+              sys.exit("Release versionCode must be a canonical positive integer.")
+          code = int(raw)
+          if not 1 <= code <= 2100000000:
+              sys.exit("Release versionCode is outside Android's supported range.")
+          if code <= baseline:
+              sys.exit(f"Release versionCode must exceed the verified baseline {baseline}.")
+          PY
+          then
+            if [[ "$is_push" == true ]]; then
+              echo "::warning::Compatible update APK skipped: this run's versionCode does not exceed baseline 106."
+              echo "No installable APK was published because its versionCode must be greater than 106." >> "$GITHUB_STEP_SUMMARY"
+              echo "built=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            exit 1
+          fi
+
+          release_keystore="$RUNNER_TEMP/vibe-reader-release.jks"
+          umask 077
+          trap 'rm -f "$release_keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$release_keystore"
+          test -s "$release_keystore"
+          unset ANDROID_KEYSTORE_BASE64
+          export ANDROID_KEYSTORE_PATH="$release_keystore"
+          gradle :app:assembleRelease -PappVersionCode="$release_version_code" --stacktrace
+          unset ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
+
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          apk = "app/build/outputs/apk/release/app-release.apk"
+          aapt = os.path.join(os.environ["ANDROID_HOME"], "build-tools", "36.0.0", "aapt")
+          apksigner = os.path.join(os.environ["ANDROID_HOME"], "build-tools", "36.0.0", "apksigner")
+          badging = subprocess.run([aapt, "dump", "badging", apk], check=True, capture_output=True, text=True).stdout
+          package = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)'", badging, re.M)
+          if not package or package.group(1) != "com.paperlight.reader":
+              sys.exit("Update APK has an unexpected or unreadable application ID.")
+          if package.group(2) != os.environ["RELEASE_VERSION_CODE"]:
+              sys.exit("Update APK versionCode does not match the selected version code.")
+          if int(package.group(2)) <= int(os.environ["UPDATE_BASELINE_VERSION_CODE"]):
+              sys.exit("Update APK versionCode does not exceed the latest artifact baseline.")
+          signature = subprocess.run([apksigner, "verify", "--verbose", "--print-certs", apk],
+                                     check=True, capture_output=True, text=True)
+          signer_output = signature.stdout + signature.stderr
+          actual = re.search(r"Signer #1 certificate SHA-256 digest:\s*([0-9A-Fa-f:]+)", signer_output)
+          expected = os.environ["UPDATE_BASELINE_CERT_SHA256"].replace(":", "").strip().lower()
+          if not actual or actual.group(1).replace(":", "").lower() != expected:
+              sys.exit("Update APK signer does not match the pinned latest-artifact certificate.")
+          print("Compatible update APK package, versionCode, and signer verified.")
+          PY
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload compatible APK
+        if: steps.compatible_update.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: Paperlight-release
+          name: ${{ inputs.build_release && 'Paperlight-release' || 'Paperlight-update' }}
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
