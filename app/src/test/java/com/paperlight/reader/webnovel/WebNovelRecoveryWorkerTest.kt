@@ -27,11 +27,11 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class WebNovelRecoveryWorkerTest {
-    @Test fun persistedCooldownSchedulesOneWorkPerRecoveryGeneration() = runBlocking {
+    @Test fun persistedCooldownSchedulesOneWorkPerRecoveryGeneration() = runBlocking<Unit> {
         val context = RuntimeEnvironment.getApplication() as Context
         WorkManagerTestInitHelper.initializeTestWorkManager(context)
         val manager = WorkManager.getInstance(context)
-        manager.cancelAllWork().get(5, TimeUnit.SECONDS)
+        manager.cancelAllWork().result.get(5, TimeUnit.SECONDS)
         val now = System.currentTimeMillis()
         val first = job("deferred-work", now + TimeUnit.HOURS.toMillis(2), now)
 
@@ -46,7 +46,7 @@ class WebNovelRecoveryWorkerTest {
         val generations = manager.getWorkInfosByTag("web-novel-recovery-${first.id}").get(5, TimeUnit.SECONDS)
         assertEquals(2, generations.size)
         assertTrue(generations.all { it.state == WorkInfo.State.ENQUEUED })
-        manager.cancelAllWork().get(5, TimeUnit.SECONDS)
+        manager.cancelAllWork().result.get(5, TimeUnit.SECONDS)
     }
 
     @Test fun workerResumesFullyCachedDueJobAndImportsExactlyOneBook() = runBlocking {
