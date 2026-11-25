@@ -48,7 +48,29 @@ class NovelPingChapterArchiveTest {
                 "https://novelping.com/book/story/chapter-2" to "Chapter 2: Second",
                 "https://novelping.com/book/story/chapter-1" to "Chapter 1: First",
             ),
-            NovelPingChapterArchive.extractLinks(archive, URI("https://novelping.com/book/story"), "a[href]"),
+            NovelPingChapterArchive.extractLinks(archive, URI("https://novelping.com/book/story")),
+        )
+    }
+
+    @Test fun archiveExtractionReturnsTheFullChapterListInOrder() {
+        val archive = Jsoup.parse(
+            """
+            <ul class="chapter-list">
+              <li><a href="/book/story/chapter-1">Chapter 1: First</a></li>
+              <li><a href="/book/story/chapter-2">Chapter 2: Second</a></li>
+              <li><a href="/book/story/chapter-3">Chapter 3: Third</a></li>
+            </ul>
+            """.trimIndent(),
+            "https://novelping.com/ajax/chapter-archive?novelId=story",
+        )
+
+        assertEquals(
+            listOf(
+                "https://novelping.com/book/story/chapter-1" to "Chapter 1: First",
+                "https://novelping.com/book/story/chapter-2" to "Chapter 2: Second",
+                "https://novelping.com/book/story/chapter-3" to "Chapter 3: Third",
+            ),
+            NovelPingChapterArchive.extractLinks(archive, URI("https://novelping.com/book/story")),
         )
     }
 }

@@ -343,8 +343,9 @@ internal object WebNovelBackupCodec {
         require(source.cacheUpdatedAt == null || source.cacheUpdatedAt >= 0L)
         require(source.createdAt >= 0L && source.updatedAt >= 0L)
         when (source.id) {
-            "standard-ebooks" -> require(source.kind == DiscoverySourceKind.STANDARD_EBOOKS)
-            "project-gutenberg" -> require(source.kind == DiscoverySourceKind.GUTENBERG)
+            DiscoverySourceIds.STANDARD_EBOOKS -> require(source.kind == DiscoverySourceKind.STANDARD_EBOOKS)
+            DiscoverySourceIds.NOVELPING -> require(source.kind == DiscoverySourceKind.HTML)
+            DiscoverySourceIds.GUTENBERG -> require(source.kind == DiscoverySourceKind.GUTENBERG)
             else -> require(source.kind in setOf(DiscoverySourceKind.OPDS, DiscoverySourceKind.HTML)) {
                 "Only custom OPDS and HTML sources can be restored."
             }
@@ -549,7 +550,7 @@ internal object WebNovelBackupCodec {
         return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
-    private val BUILTIN_IDS = setOf("standard-ebooks", "project-gutenberg")
+    private val BUILTIN_IDS = DiscoverySourceIds.BUILT_INS + DiscoverySourceIds.GUTENBERG
     private val JOB_STATES = setOf(WebNovelJobState.QUEUED, WebNovelJobState.RUNNING,
         WebNovelJobState.WAITING_RATE_LIMIT, WebNovelJobState.PAUSE_REQUESTED, WebNovelJobState.PAUSED,
         WebNovelJobState.CANCEL_REQUESTED, WebNovelJobState.CANCELLED, WebNovelJobState.INTERRUPTED,

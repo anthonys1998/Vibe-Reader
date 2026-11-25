@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [BookEntity::class, LibraryEntity::class, WebNovelJobEntity::class, DiscoverySourceEntity::class, RestoreTransactionEntity::class], version = 8, exportSchema = false)
+@Database(entities = [BookEntity::class, LibraryEntity::class, WebNovelJobEntity::class, DiscoverySourceEntity::class, RestoreTransactionEntity::class], version = 9, exportSchema = false)
 abstract class BookDatabase : RoomDatabase() {
     abstract fun bookDao(): BookDao
 
@@ -63,13 +63,38 @@ abstract class BookDatabase : RoomDatabase() {
             }
         }
 
+        internal val removeGutenbergAndSeedNovelPing = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DELETE FROM `discovery_sources` WHERE `id` = '${DiscoverySourceIds.GUTENBERG}' AND `kind` = '${DiscoverySourceKind.GUTENBERG}' AND lower(`baseUrl`) = '${DiscoverySourceIds.LEGACY_GUTENBERG_URL}'")
+                seedDiscoverySources(db)
+            }
+        }
+
         private fun createDiscoverySources(db: SupportSQLiteDatabase) {
             db.execSQL("CREATE TABLE IF NOT EXISTS `discovery_sources` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `baseUrl` TEXT NOT NULL, `enabled` INTEGER NOT NULL, `configJson` TEXT NOT NULL, `cacheKey` TEXT, `cacheJson` TEXT, `cacheUpdatedAt` INTEGER, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))")
         }
 
         internal fun seedDiscoverySources(db: SupportSQLiteDatabase) {
             db.execSQL("INSERT OR IGNORE INTO `discovery_sources` (`id`, `name`, `kind`, `baseUrl`, `enabled`, `configJson`, `cacheKey`, `cacheJson`, `cacheUpdatedAt`, `createdAt`, `updatedAt`) VALUES ('standard-ebooks', 'Standard Ebooks', 'STANDARD_EBOOKS', 'https://standardebooks.org/ebooks', 1, '{}', NULL, NULL, NULL, 0, 0)")
-            db.execSQL("INSERT OR IGNORE INTO `discovery_sources` (`id`, `name`, `kind`, `baseUrl`, `enabled`, `configJson`, `cacheKey`, `cacheJson`, `cacheUpdatedAt`, `createdAt`, `updatedAt`) VALUES ('project-gutenberg', 'Project Gutenberg', 'GUTENBERG', 'https://www.gutenberg.org/ebooks/search.opds/', 1, '{}', NULL, NULL, NULL, 1, 1)")
+            db.execSQL("""
+                INSERT OR IGNORE INTO `discovery_sources`
+                    (`id`, `name`, `kind`, `baseUrl`, `enabled`, `configJson`, `cacheKey`, `cacheJson`, `cacheUpdatedAt`, `createdAt`, `updatedAt`)
+                SELECT 'novelping', 'NovelPing', 'HTML', 'https://novelping.com', 1, '{"purpose":"CONVERT_WEBSITE"}', NULL, NULL, NULL, 1, 1
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM (
+                        SELECT `kind`, lower(CASE
+                            WHEN lower(`baseUrl`) LIKE 'https://%' THEN substr(lower(`baseUrl`), 9)
+                            WHEN lower(`baseUrl`) LIKE 'http://%' THEN substr(lower(`baseUrl`), 8)
+                            ELSE lower(`baseUrl`)
+                        END) AS `address`
+                        FROM `discovery_sources`
+                    ) AS `existing`
+                    WHERE `kind` = 'HTML' AND (
+                        (substr(`address`, 1, 13) = 'novelping.com' AND substr(`address`, 14, 1) IN ('', '/', '?', '#', ':')) OR
+                        (substr(`address`, 1, 17) = 'www.novelping.com' AND substr(`address`, 18, 1) IN ('', '/', '?', '#', ':'))
+                    )
+                )
+            """.trimIndent())
         }
 
         @Volatile private var INSTANCE: BookDatabase? = null
@@ -80,7 +105,7 @@ abstract class BookDatabase : RoomDatabase() {
                     context.applicationContext,
                     BookDatabase::class.java,
                     "paperlight-library.db"
-                ).addMigrations(addChapterPage, resetChapterCounts, addLibraries, addWebNovelJobs, addWebNovelJobTitle, addDiscoverySources, addBackupRecoveryAndAutomaticJobs)
+                ).addMigrations(addChapterPage, resetChapterCounts, addLibraries, addWebNovelJobs, addWebNovelJobTitle, addDiscoverySources, addBackupRecoveryAndAutomaticJobs, removeGutenbergAndSeedNovelPing)
                     .addCallback(object : RoomDatabase.Callback() {
                         override fun onCreate(db: SupportSQLiteDatabase) {
                             seedDiscoverySources(db)

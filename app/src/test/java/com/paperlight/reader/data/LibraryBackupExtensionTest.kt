@@ -94,6 +94,7 @@ class LibraryBackupExtensionTest {
         val restoredBuiltin = requireNotNull(targetDb.bookDao().discoverySourceById(DiscoverySourceIds.STANDARD_EBOOKS))
         assertFalse(restoredBuiltin.enabled)
         assertEquals("https://standardebooks.org/ebooks", restoredBuiltin.baseUrl)
+        assertFalse(requireNotNull(targetDb.bookDao().discoverySourceById(DiscoverySourceIds.NOVELPING)).enabled)
         val restoredJob = requireNotNull(targetDb.bookDao().webNovelJobById(job.id))
         assertEquals(WebNovelJobState.PAUSED, restoredJob.status)
         assertEquals(1, restoredJob.completed)
@@ -230,6 +231,7 @@ class LibraryBackupExtensionTest {
         val source = source()
         dao.insertDiscoverySource(source)
         dao.setDiscoverySourceEnabled(DiscoverySourceIds.STANDARD_EBOOKS, false, now)
+        dao.setDiscoverySourceEnabled(DiscoverySourceIds.NOVELPING, false, now)
         val options = WebNovelScrapeOptions()
         val sourceUrl = "https://novel.example/story"
         val key = WebNovelEpubUtility.checkpointKey(sourceUrl, options)

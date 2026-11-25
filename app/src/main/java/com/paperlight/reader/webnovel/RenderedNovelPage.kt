@@ -1,6 +1,8 @@
 package com.paperlight.reader.webnovel
 
 import android.content.Context
+import android.net.http.SslError
+import android.webkit.SslErrorHandler
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -26,7 +28,9 @@ internal class RenderedNovelPage(
             val browser = WebView(context.applicationContext)
             try {
                 var failure: String? = null
+                var sslFailure: String? = null
                 var finished = false
+                var mainFrameUrl = url
                 browser.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
@@ -41,6 +45,7 @@ internal class RenderedNovelPage(
                         request.url.scheme?.lowercase() !in setOf("http", "https")
 
                     override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                        mainFrameUrl = url
                         finished = false
                     }
 
@@ -49,18 +54,33 @@ internal class RenderedNovelPage(
                     }
 
                     override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
-                        if (request.isForMainFrame) failure = "The website returned HTTP ${response.statusCode}."
+                        if (request.isForMainFrame && failure == null) failure = "The website returned HTTP ${response.statusCode}."
                     }
 
                     override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                        if (request.isForMainFrame) failure = error.description.toString()
+                        if (request.isForMainFrame && failure == null) {
+                            failure = if (error.errorCode == WebViewClient.ERROR_FAILED_SSL_HANDSHAKE) {
+                                sslErrorDescription(null).also { sslFailure = sslFailure ?: it }
+                            } else error.description.toString()
+                        }
+                    }
+
+                    override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                        handler?.cancel()
+                        val description = sslErrorDescription(error)
+                        sslFailure = sslFailure ?: description
+                        if (error?.url == mainFrameUrl && failure == null) failure = description
                     }
                 }
                 browser.loadUrl(url)
                 var lastTitle = ""
                 suspend fun awaitContent(): Document {
                     while (true) {
-                        failure?.let { error("Could not load $url. $it") }
+                        failure?.let { message ->
+                            val target = if (sslFailure == null) url else "the requested page"
+                            val extra = sslFailure?.takeUnless { it == message }?.let { " HTTPS certificate detail: $it" }.orEmpty()
+                            error("Could not load $target. $message$extra")
+                        }
                         if (finished) {
                             val snapshot = browser.snapshot()
                             if (snapshot != null) {
@@ -81,8 +101,11 @@ internal class RenderedNovelPage(
                     }
                 }
                 withTimeoutOrNull(25_000) { awaitContent() }
-                    ?: error("No matching content appeared in the browser for $url." +
-                        if (lastTitle.isBlank()) "" else " Page title: $lastTitle.")
+                    ?: run {
+                        val titleSuffix = if (lastTitle.isBlank()) "" else " Page title: $lastTitle."
+                        val sslSuffix = sslFailure?.let { " HTTPS certificate detail: $it" }.orEmpty()
+                        error("No matching content appeared in the browser.$titleSuffix$sslSuffix")
+                    }
             } finally {
                 browser.stopLoading()
                 browser.destroy()
@@ -103,5 +126,18 @@ internal class RenderedNovelPage(
 
     private companion object {
         const val MAX_SNAPSHOT_CHARS = 8_000_000
+
+        fun sslErrorDescription(error: SslError?): String {
+            val reason = when (error?.primaryError) {
+                SslError.SSL_DATE_INVALID -> "the certificate date is invalid"
+                SslError.SSL_EXPIRED -> "the certificate has expired"
+                SslError.SSL_IDMISMATCH -> "the certificate does not match the site hostname"
+                SslError.SSL_NOTYETVALID -> "the certificate is not valid yet"
+                SslError.SSL_UNTRUSTED -> "the certificate is not trusted"
+                SslError.SSL_INVALID -> "the certificate is invalid"
+                else -> "certificate verification failed"
+            }
+            return "the browser rejected the HTTPS certificate because $reason."
+        }
     }
 }

@@ -297,10 +297,11 @@ interface BookDao {
         require(books.none { it.id in existingBooks }) { "The library changed during restore. Please retry." }
         books.forEach { insertBook(it) }
         val existingSourceIds = allDiscoverySources().map { it.id }.toSet()
-        sources.filterNot { it.id in existingSourceIds }.forEach { insertDiscoverySourceIfMissing(it) }
+        sources.filterNot(DiscoverySourceIds::isRemovedGutenbergBuiltin)
+            .filterNot { it.id in existingSourceIds }.forEach { insertDiscoverySourceIfMissing(it) }
         if (replaceBuiltinEnabled) {
             builtinEnabled.forEach { (id, enabled) ->
-                if (id in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+                if (id in DiscoverySourceIds.BUILT_INS) {
                     setDiscoverySourceEnabled(id, enabled, now)
                 }
             }

@@ -5,6 +5,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
 import android.content.Context
+import com.paperlight.reader.discovery.DiscoverySourceConfigCodec
+import com.paperlight.reader.discovery.DiscoverySourcePurpose
 import com.paperlight.reader.webnovel.WebNovelScrapeOptions
 import com.paperlight.reader.webnovel.WebNovelChapterManifest
 import com.paperlight.reader.webnovel.WebNovelChapterManifestCodec
@@ -354,13 +356,13 @@ class WebNovelJobPersistenceTest {
 
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
             .addMigrations(BookDatabase.addWebNovelJobs, BookDatabase.addWebNovelJobTitle, BookDatabase.addDiscoverySources,
-                BookDatabase.addBackupRecoveryAndAutomaticJobs).build()
+                BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing).build()
         try {
             runBlocking {
                 assertEquals("Existing", migrated.bookDao().bookById("existing")?.title)
                 assertNotNull(migrated.bookDao().findLibrary("default"))
                 assertTrue(migrated.bookDao().observeWebNovelJobs().first().isEmpty())
-                assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG),
+                assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.NOVELPING),
                     migrated.bookDao().allDiscoverySources().map { it.id }.toSet())
             }
         } finally {
@@ -387,7 +389,7 @@ class WebNovelJobPersistenceTest {
 
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
             .addMigrations(BookDatabase.addWebNovelJobTitle, BookDatabase.addDiscoverySources,
-                BookDatabase.addBackupRecoveryAndAutomaticJobs).build()
+                BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing).build()
         try {
             val legacy = requireNotNull(migrated.bookDao().webNovelJobById("legacy-job"))
             assertEquals(WebNovelJobState.PAUSED, legacy.status)
@@ -416,12 +418,17 @@ class WebNovelJobPersistenceTest {
         old.version = 6
         old.close()
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
-            .addMigrations(BookDatabase.addDiscoverySources, BookDatabase.addBackupRecoveryAndAutomaticJobs).build()
+            .addMigrations(BookDatabase.addDiscoverySources, BookDatabase.addBackupRecoveryAndAutomaticJobs,
+                BookDatabase.removeGutenbergAndSeedNovelPing).build()
         try {
             assertEquals("Saved", migrated.bookDao().bookById("saved-book")?.title)
             assertEquals(WebNovelJobState.PAUSED, migrated.bookDao().webNovelJobById("saved-job")?.status)
-            assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG),
+            assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.NOVELPING),
                 migrated.bookDao().allDiscoverySources().map { it.id }.toSet())
+            val novelPing = requireNotNull(migrated.bookDao().discoverySourceById(DiscoverySourceIds.NOVELPING))
+            assertEquals(DiscoverySourceKind.HTML, novelPing.kind)
+            assertEquals(DiscoverySourcePurpose.CONVERT_WEBSITE,
+                DiscoverySourceConfigCodec.decode(novelPing.configJson).purpose)
         } finally {
             migrated.close()
             context.deleteDatabase(name)
@@ -440,6 +447,10 @@ class WebNovelJobPersistenceTest {
         old.execSQL("CREATE INDEX index_web_novel_jobs_createdAt ON web_novel_jobs (createdAt)")
         old.execSQL("CREATE TABLE discovery_sources (id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, baseUrl TEXT NOT NULL, enabled INTEGER NOT NULL, configJson TEXT NOT NULL, cacheKey TEXT, cacheJson TEXT, cacheUpdatedAt INTEGER, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, PRIMARY KEY(id))")
         old.execSQL("INSERT INTO libraries VALUES ('default', 'My Library', 0)")
+        old.execSQL("INSERT INTO discovery_sources VALUES ('standard-ebooks', 'Standard Ebooks', 'STANDARD_EBOOKS', 'https://standardebooks.org/ebooks', 0, '{\"kept\":true}', 'standard-cache', '{\"saved\":true}', 7, 0, 8)")
+        old.execSQL("INSERT INTO discovery_sources VALUES ('project-gutenberg', 'Project Gutenberg', 'GUTENBERG', 'https://www.gutenberg.org/ebooks/search.opds/', 0, '{}', NULL, NULL, NULL, 1, 1)")
+        old.execSQL("INSERT INTO discovery_sources VALUES ('custom-novelping', 'My NovelPing', 'HTML', 'https://novelping.com/sort/popular', 0, '{\"purpose\":\"CONVERT_WEBSITE\"}', 'novel-cache', '{\"books\":[]}', 9, 2, 10)")
+        old.execSQL("INSERT INTO discovery_sources VALUES ('custom-catalog', 'My Catalog', 'OPDS', 'https://books.example/catalog', 1, '{}', NULL, NULL, NULL, 3, 4)")
         fun insertJob(id: String, status: String) {
             old.execSQL("INSERT INTO web_novel_jobs (id, sourceUrl, optionsJson, libraryId, status, completed, total, label, checkpointKey, resultBookId, createdAt, updatedAt) VALUES ('$id', 'https://example.org/$id', '{}', 'default', '$status', 0, 0, '$status', 'key-$id', 'result-$id', 1, 2)")
         }
@@ -451,7 +462,7 @@ class WebNovelJobPersistenceTest {
         old.close()
 
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
-            .addMigrations(BookDatabase.addBackupRecoveryAndAutomaticJobs).build()
+            .addMigrations(BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing).build()
         try {
             val dao = migrated.bookDao()
             assertTrue(requireNotNull(dao.webNovelJobById("queued")).autoRun)
@@ -460,6 +471,12 @@ class WebNovelJobPersistenceTest {
             assertFalse(requireNotNull(dao.webNovelJobById("cancelled")).autoRun)
             assertNull(dao.webNovelJobById("waiting")?.runnerType)
             assertFalse(dao.hasRestoreTransaction("restore-marker"))
+            val preservedSources = dao.allDiscoverySources().associateBy { it.id }
+            assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, "custom-novelping", "custom-catalog"), preservedSources.keys)
+            assertFalse(requireNotNull(preservedSources[DiscoverySourceIds.STANDARD_EBOOKS]).enabled)
+            assertEquals("{\"kept\":true}", preservedSources[DiscoverySourceIds.STANDARD_EBOOKS]?.configJson)
+            assertEquals("novel-cache", preservedSources["custom-novelping"]?.cacheKey)
+            assertFalse(requireNotNull(preservedSources["custom-novelping"]).enabled)
             dao.insertRestoreTransaction(RestoreTransactionEntity("restore-marker", 5L))
             assertTrue(dao.hasRestoreTransaction("restore-marker"))
             assertEquals(1, dao.deleteRestoreTransaction("restore-marker"))
@@ -490,7 +507,7 @@ class WebNovelJobPersistenceTest {
         assertTrue(repository.deleteDiscoverySource(source.id))
         repository.ensureDefaultLibrary()
         assertNull(dao.discoverySourceById(source.id))
-        assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG),
+        assertEquals(setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.NOVELPING),
             dao.allDiscoverySources().map { it.id }.toSet())
     }
 

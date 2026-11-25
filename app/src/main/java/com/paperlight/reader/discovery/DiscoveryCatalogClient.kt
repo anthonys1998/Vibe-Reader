@@ -1090,7 +1090,10 @@ object DiscoveryCatalogClient {
         try {
             return fetchDocument(url)
         } catch (failure: Exception) {
-            if (failure is CancellationException || !failure.isTlsFailure() || fallbackContext == null) throw failure
+            if (failure is CancellationException || !failure.isTlsFailure()) throw failure
+            if (fallbackContext == null) {
+                throw IllegalStateException(secureTlsErrorMessage(), failure)
+            }
             try {
                 val safeUrl = validateHttpUrl(url)
                 val rendered = RenderedNovelPage(fallbackContext, MAX_CATALOG_BYTES).load(safeUrl) { document ->
@@ -1103,13 +1106,18 @@ object DiscoveryCatalogClient {
             } catch (fallbackFailure: Exception) {
                 if (fallbackFailure is CancellationException) throw fallbackFailure
                 throw IllegalStateException(
-                    "Java could not verify this site’s HTTPS certificate, and the secure browser fallback failed: " +
-                        fallbackFailure.message.orEmpty(),
+                    secureTlsErrorMessage(fallbackFailure.message),
                     fallbackFailure,
                 )
             }
         }
     }
+
+    private fun secureTlsErrorMessage(fallbackDetail: String? = null): String =
+        "Java could not verify this website’s HTTPS certificate." +
+            (fallbackDetail?.takeIf(String::isNotBlank)?.let { " The secure browser fallback also failed: $it." } ?: "") +
+            " The certificate may be misconfigured, or a network proxy may be intercepting HTTPS. " +
+            "Check the device date or ask the network administrator; certificate validation remains enabled."
 
     private fun Throwable.isTlsFailure(): Boolean {
         val visited = mutableSetOf<Throwable>()

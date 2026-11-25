@@ -17,11 +17,9 @@ internal object NovelPingChapterArchive {
         return pageUri.resolve("/ajax/chapter-archive?novelId=$novelId").toString()
     }
 
-    /** Resolve archive anchors against the book page and retain the order supplied by the site. */
-    fun extractLinks(archive: Document, bookUri: URI, selector: String): List<Pair<String, String?>> {
-        val candidates = archive.select(selector).mapNotNull { element ->
-            val anchor = if (element.normalName() == "a") element
-                else element.selectFirst("a[href]") ?: return@mapNotNull null
+    /** Resolve every archive anchor against the book page; selectors from the static TOC do not apply here. */
+    fun extractLinks(archive: Document, bookUri: URI): List<Pair<String, String?>> {
+        val candidates = archive.select("a[href]").mapNotNull { anchor ->
             val href = anchor.attr("href").trim()
             val uri = runCatching { bookUri.resolve(URI(href)).normalize() }.getOrNull() ?: return@mapNotNull null
             if (!uri.scheme.equals(bookUri.scheme, true) || uri.host?.equals(bookUri.host, true) != true ||

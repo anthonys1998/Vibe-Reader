@@ -190,14 +190,16 @@ class WebNovelEpubUtility(context: Context) {
         val toc = if (options.renderInBrowser) {
             awaitCooldown(start.toString(), onRateLimitWait)
             renderer.load(start.toString()) { document ->
-                val found = links(document).size
-                val expected = if (isNovelBin(document) && options.chapterLinkSelector == "a[href]") {
-                    document.selectFirst(".chapter-box-count")?.text()?.substringBefore(' ')?.toIntOrNull()
-                } else null
-                found > 0 && (expected == null || found >= expected)
+                if (NovelPingChapterArchive.urlFor(document) != null) true else {
+                    val found = links(document).size
+                    val expected = if (isNovelBin(document) && options.chapterLinkSelector == "a[href]") {
+                        document.selectFirst(".chapter-box-count")?.text()?.substringBefore(' ')?.toIntOrNull()
+                    } else null
+                    found > 0 && (expected == null || found >= expected)
+                }
             }
         } else fetch(start.toString(), onRateLimitWait)
-        val chapterLinks = novelPingChapterLinks(toc, options, onRateLimitWait) ?: links(toc)
+        val chapterLinks = novelPingChapterLinks(toc, onRateLimitWait) ?: links(toc)
         require(chapterLinks.isNotEmpty()) {
             "No chapter links found. Check the table of contents URL and selectors, or enable browser rendering."
         }
@@ -206,14 +208,13 @@ class WebNovelEpubUtility(context: Context) {
 
     private suspend fun novelPingChapterLinks(
         toc: Document,
-        options: WebNovelScrapeOptions,
         onRateLimitWait: suspend (String, Long?) -> Unit,
     ): List<Pair<String, String?>>? {
         val archiveUrl = NovelPingChapterArchive.urlFor(toc) ?: return null
         val archiveRequired = toc.selectFirst("#chapter-archive .loading") != null
         return try {
             val archive = fetch(archiveUrl, onRateLimitWait)
-            NovelPingChapterArchive.extractLinks(archive, validateHttpUrl(toc.baseUri()), options.chapterLinkSelector)
+            NovelPingChapterArchive.extractLinks(archive, validateHttpUrl(toc.baseUri()))
                 .takeIf { it.isNotEmpty() }
                 ?: if (archiveRequired) error("NovelPing returned an empty chapter archive.") else null
         } catch (failure: RateLimitDeferredException) {

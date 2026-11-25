@@ -573,7 +573,7 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
                     "HTML sources need book-card, title, and details-link selectors."
                 }
             }
-            require(source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+            require(source.id !in DiscoverySourceIds.BUILT_INS) {
                 "Built-in sources cannot be edited."
             }
             val existing = dao.discoverySourceById(source.id)
@@ -593,7 +593,7 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
             require(source.baseUrl == expectedBaseUrl) {
                 "This discovery source changed. Reopen it before saving scraper settings."
             }
-            require(source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+            require(source.id != DiscoverySourceIds.STANDARD_EBOOKS) {
                 "Built-in catalogs do not have website conversion settings."
             }
             val page = java.net.URI(pageUrl.trim())
@@ -625,7 +625,7 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
 
     suspend fun deleteDiscoverySource(id: String) = withContext(Dispatchers.IO) {
         withLibraryOperation {
-            require(id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+            require(id !in DiscoverySourceIds.BUILT_INS) {
                 "Built-in sources cannot be deleted."
             }
             dao.deleteDiscoverySource(id) > 0

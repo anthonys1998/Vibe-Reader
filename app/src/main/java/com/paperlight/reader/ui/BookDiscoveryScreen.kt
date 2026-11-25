@@ -81,7 +81,7 @@ internal fun BookDiscoveryScreen(
         mutableStateOf(discoveryPreferences.getBoolean("catalogGridLayout", true))
     }
     var query by rememberSaveable { mutableStateOf("") }
-    var selectedSourceId by rememberSaveable { mutableStateOf(DiscoverySourceIds.STANDARD_EBOOKS) }
+    var selectedSourceId by rememberSaveable { mutableStateOf(DiscoverySourceIds.NOVELPING) }
     var requestStateSourceId by rememberSaveable { mutableStateOf<String?>(null) }
     var mode by rememberSaveable { mutableStateOf(DiscoveryCatalogClient.MODE_LATEST) }
     var requestedQuery by rememberSaveable { mutableStateOf("") }
@@ -110,6 +110,9 @@ internal fun BookDiscoveryScreen(
     var editorConfig by remember { mutableStateOf(DiscoverySourceConfig()) }
     var editorPreviewTitles by remember { mutableStateOf<List<String>>(emptyList()) }
     var editorDetected by remember { mutableStateOf(false) }
+    var editorHasManualConfig by remember { mutableStateOf(false) }
+    var editorManualSetup by remember { mutableStateOf(false) }
+    var editorManualConfigEdited by remember { mutableStateOf(false) }
     var detecting by remember { mutableStateOf(false) }
     var suggestingSelectors by remember { mutableStateOf(false) }
     var editorError by remember { mutableStateOf<String?>(null) }
@@ -119,8 +122,17 @@ internal fun BookDiscoveryScreen(
     var requestGeneration by remember { mutableIntStateOf(0) }
     val enabledSources = sources.filter { it.enabled }
     val selectedSource = sources.firstOrNull { it.id == selectedSourceId && it.enabled }
+        ?: enabledSources.firstOrNull { it.id == DiscoverySourceIds.NOVELPING || isNovelPingSource(it) }
         ?: enabledSources.firstOrNull { it.kind == DiscoverySourceKind.STANDARD_EBOOKS }
         ?: enabledSources.firstOrNull()
+    val duplicateNovelPingSource = editorKind == DiscoverySourceKind.HTML && isNovelPingUrl(editorUrl) &&
+        sources.any { it.id != editorId && isNovelPingSource(it) }
+    val manualConfigurationReady = editorHasManualConfig && (!editorManualSetup || editorManualConfigEdited)
+    val editorCanSave = (editorDetected || manualConfigurationReady) && editorName.isNotBlank() &&
+        isValidDiscoverySourceUrl(editorUrl) && !detecting &&
+        !duplicateNovelPingSource &&
+        (editorKind != DiscoverySourceKind.HTML || listOf(editorConfig.htmlBookSelector,
+            editorConfig.htmlTitleSelector, editorConfig.htmlDetailLinkSelector).all(String::isNotBlank))
     val sourceIdentity = selectedSource?.let { listOf(it.id, it.kind, it.baseUrl, it.configJson).joinToString("\n") }
     val sourceChanged = sourceIdentity != requestStateSourceId
     val effectiveQuery = if (sourceChanged) "" else requestedQuery
@@ -161,6 +173,9 @@ internal fun BookDiscoveryScreen(
         editorConfig = suggestedConfig ?: source?.let { DiscoverySourceConfigCodec.decode(it.configJson) } ?: DiscoverySourceConfig()
         editorPreviewTitles = previewTitles.take(4)
         editorDetected = source != null
+        editorHasManualConfig = source != null || suggestedConfig != null
+        editorManualSetup = false
+        editorManualConfigEdited = false
         editorError = null
         suggestingSelectors = false
         editorVisible = true
@@ -172,7 +187,7 @@ internal fun BookDiscoveryScreen(
     }
 
     fun previewEditorListing() {
-        if (!editorDetected || editorKind != DiscoverySourceKind.HTML || detecting) return
+        if ((!editorDetected && !editorHasManualConfig) || editorKind != DiscoverySourceKind.HTML || detecting) return
         detecting = true
         editorError = null
         val previewSource = DiscoverySourceEntity(editorId, editorName.ifBlank { "Preview" }, editorKind, editorUrl.trim(),
@@ -183,6 +198,7 @@ internal fun BookDiscoveryScreen(
                 val preview = DiscoveryCatalogClient.search(previewSource, "", DiscoveryCatalogClient.MODE_BROWSE,
                     renderedContext = context.applicationContext)
                 editorPreviewTitles = preview.books.take(4).map { it.title }
+                if (editorManualSetup && preview.books.isNotEmpty()) editorManualConfigEdited = true
                 editorError = if (editorPreviewTitles.isEmpty()) "No book cards matched these selectors."
                     else "Previewed ${preview.books.size} books with the current settings."
             } catch (cancelled: CancellationException) {
@@ -502,7 +518,7 @@ internal fun BookDiscoveryScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(source.name, style = MaterialTheme.typography.titleSmall)
-                                Text(sourceKindLabel(source.kind), style = MaterialTheme.typography.labelSmall,
+                                Text(sourceKindLabel(source.kind, source.id), style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Switch(checked = source.enabled, enabled = downloadingId == null,
@@ -532,7 +548,7 @@ internal fun BookDiscoveryScreen(
                                 manageSources = false
                                 refreshRevision++
                             }, enabled = source.enabled && downloadingId == null) { Text("Browse") }
-                            if (source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+                            if (source.id !in DiscoverySourceIds.BUILT_INS) {
                                 IconButton(enabled = downloadingId == null, onClick = { beginEdit(source) }) {
                                     Icon(Icons.Rounded.Edit, contentDescription = "Edit " + source.name)
                                 }
@@ -680,7 +696,7 @@ internal fun BookDiscoveryScreen(
     if (editorVisible) {
         AlertDialog(
             onDismissRequest = { if (!detecting) editorVisible = false },
-            title = { Text(if (editorDetected && editorId !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG))
+            title = { Text(if (editorDetected && editorId !in DiscoverySourceIds.BUILT_INS)
                 "Edit source" else "Add source") },
             text = {
                 Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
@@ -691,6 +707,11 @@ internal fun BookDiscoveryScreen(
                         editorUrl = it.take(4096)
                         editorDetected = false
                         editorPreviewTitles = emptyList()
+                        editorError = null
+                        if (!editorManualSetup) {
+                            editorHasManualConfig = false
+                            editorManualConfigEdited = false
+                        }
                     }, enabled = !detecting, label = { Text("Source URL") }, singleLine = true,
                         supportingText = { Text("Use the public page with book cards. Detect, Preview, and Groq suggestions use this URL; for NovelPing, try its alternate listing page if the homepage has no cards.") })
                     Text("Add action", style = MaterialTheme.typography.titleSmall)
@@ -734,6 +755,9 @@ internal fun BookDiscoveryScreen(
                                 if (detected.kind == DiscoverySourceKind.STANDARD_EBOOKS &&
                                     sources.any { it.id == DiscoverySourceIds.STANDARD_EBOOKS }) {
                                     editorError = "Standard Ebooks is already included as a built-in source."
+                                } else if (detected.kind == DiscoverySourceKind.HTML && isNovelPingUrl(detected.baseUrl) &&
+                                    sources.any { it.id != editorId && isNovelPingSource(it) }) {
+                                    editorError = "NovelPing is already included as a source."
                                 } else {
                                     editorKind = detected.kind
                                     editorUrl = detected.baseUrl
@@ -744,6 +768,8 @@ internal fun BookDiscoveryScreen(
                                         scrapeOptions = editorConfig.scrapeOptions)
                                     editorPreviewTitles = detected.previewTitles
                                     editorDetected = true
+                                    editorHasManualConfig = true
+                                    editorManualSetup = false
                                     editorError = "Detected " + sourceKindLabel(detected.kind) + ". Review settings before saving."
                                 }
                             } catch (cancelled: CancellationException) {
@@ -755,9 +781,18 @@ internal fun BookDiscoveryScreen(
                             }
                         }
                     }) { Text(if (detecting) "Checking…" else "Detect source") }
+                    if (!editorDetected && !editorHasManualConfig && editorUrl.isNotBlank()) {
+                        TextButton(enabled = !detecting, onClick = {
+                            editorKind = DiscoverySourceKind.HTML
+                            editorHasManualConfig = true
+                            editorManualSetup = true
+                            editorManualConfigEdited = false
+                            editorError = "Set CSS selectors for the public book listing. Saving stores these settings; use Preview listing to check whether Browse can read the page."
+                        }) { Text("Configure HTML selectors manually") }
+                    }
                     if (editorKind == DiscoverySourceKind.HTML && editorUrl.isNotBlank()) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (editorDetected) TextButton(enabled = !detecting, onClick = ::previewEditorListing) {
+                            if (editorDetected || editorHasManualConfig) TextButton(enabled = !detecting, onClick = ::previewEditorListing) {
                                 Text(if (detecting && !suggestingSelectors) "Previewing…" else "Preview listing")
                             }
                             TextButton(enabled = !detecting && editorUrl.isNotBlank(), onClick = {
@@ -786,6 +821,8 @@ internal fun BookDiscoveryScreen(
                                             )
                                             editorKind = DiscoverySourceKind.HTML
                                             editorDetected = true
+                                            editorHasManualConfig = true
+                                            editorManualSetup = false
                                         } catch (cancelled: CancellationException) {
                                             throw cancelled
                                         } catch (failure: Exception) {
@@ -807,7 +844,7 @@ internal fun BookDiscoveryScreen(
                         Text("Preview: " + editorPreviewTitles.joinToString(" · "),
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    if (editorDetected) {
+                    if (editorDetected || editorHasManualConfig) {
                         OutlinedTextField(value = editorConfig.searchUrlTemplate,
                             onValueChange = { value -> updateEditorConfig { it.copy(searchUrlTemplate = value.take(4096)) } },
                             enabled = !detecting, label = { Text("Search URL template (optional)") }, singleLine = true,
@@ -831,16 +868,16 @@ internal fun BookDiscoveryScreen(
                                 enabled = !detecting, label = { Text("Popular listing URL (optional)") }, singleLine = true,
                                 supportingText = { Text("Use a same-site page or path; leave blank to hide Popular.") })
                             OutlinedTextField(value = editorConfig.htmlBookSelector,
-                                onValueChange = { value -> updateEditorConfig { it.copy(htmlBookSelector = value.take(1000)) } },
+                                onValueChange = { value -> updateEditorConfig { it.copy(htmlBookSelector = value.take(1000)) }; editorManualConfigEdited = true },
                                 enabled = !detecting, label = { Text("Book card selector") })
                             OutlinedTextField(value = editorConfig.htmlTitleSelector,
-                                onValueChange = { value -> updateEditorConfig { it.copy(htmlTitleSelector = value.take(1000)) } },
+                                onValueChange = { value -> updateEditorConfig { it.copy(htmlTitleSelector = value.take(1000)) }; editorManualConfigEdited = true },
                                 enabled = !detecting, label = { Text("Title selector") })
                             OutlinedTextField(value = editorConfig.htmlAuthorSelector,
                                 onValueChange = { value -> updateEditorConfig { it.copy(htmlAuthorSelector = value.take(1000)) } },
                                 enabled = !detecting, label = { Text("Author selector (optional)") })
                             OutlinedTextField(value = editorConfig.htmlDetailLinkSelector,
-                                onValueChange = { value -> updateEditorConfig { it.copy(htmlDetailLinkSelector = value.take(1000)) } },
+                                onValueChange = { value -> updateEditorConfig { it.copy(htmlDetailLinkSelector = value.take(1000)) }; editorManualConfigEdited = true },
                                 enabled = !detecting, label = { Text("Book details link selector") })
                             OutlinedTextField(value = editorConfig.htmlCoverSelector,
                                 onValueChange = { value -> updateEditorConfig { it.copy(htmlCoverSelector = value.take(1000)) } },
@@ -852,12 +889,20 @@ internal fun BookDiscoveryScreen(
                     }
                     editorError?.let { Text(it, color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodySmall) }
+                    if (editorManualSetup && !editorDetected && editorKind == DiscoverySourceKind.HTML) {
+                        Text(when {
+                            editorPreviewTitles.isNotEmpty() -> "Preview found books using these selectors."
+                            editorManualConfigEdited -> "Manual selectors are ready to save. Preview listing checks whether Browse can read this page."
+                            else -> "Edit the selectors or preview a listing before saving. Manual settings alone do not confirm the site is browsable."
+                        },
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Text("Public HTTP(S) catalogs only. Sign-in and restricted catalogs are unsupported.",
                         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             },
             confirmButton = {
-                TextButton(enabled = editorDetected && editorName.isNotBlank() && !detecting, onClick = {
+                TextButton(enabled = editorCanSave, onClick = {
                     val now = System.currentTimeMillis()
                     val source = DiscoverySourceEntity(editorId, editorName.trim(), editorKind, editorUrl.trim(),
                         enabled = editorEnabled, configJson = DiscoverySourceConfigCodec.encode(editorConfig),
@@ -1025,10 +1070,23 @@ private suspend fun loadDiscoveryCover(rawUrl: String): Bitmap? = withContext(Di
 
 private fun sourceHost(url: String): String = Uri.parse(url).host.orEmpty()
 
-private fun sourceKindLabel(kind: String): String = when (kind) {
-    DiscoverySourceKind.STANDARD_EBOOKS -> "Standard Ebooks"
-    DiscoverySourceKind.GUTENBERG -> "Project Gutenberg OPDS"
-    DiscoverySourceKind.OPDS -> "Custom OPDS"
-    DiscoverySourceKind.HTML -> "Custom website"
+private fun isNovelPingUrl(url: String): Boolean = sourceHost(url).equals("novelping.com", ignoreCase = true) ||
+    sourceHost(url).equals("www.novelping.com", ignoreCase = true)
+
+private fun isNovelPingSource(source: DiscoverySourceEntity): Boolean =
+    source.kind == DiscoverySourceKind.HTML && isNovelPingUrl(source.baseUrl)
+
+private fun isValidDiscoverySourceUrl(value: String): Boolean = runCatching {
+    val uri = java.net.URI(value.trim())
+    (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) &&
+        !uri.host.isNullOrBlank() && uri.userInfo == null
+}.getOrDefault(false)
+
+private fun sourceKindLabel(kind: String, sourceId: String? = null): String = when {
+    sourceId == DiscoverySourceIds.NOVELPING -> "NovelPing catalog"
+    kind == DiscoverySourceKind.STANDARD_EBOOKS -> "Standard Ebooks"
+    kind == DiscoverySourceKind.GUTENBERG -> "Project Gutenberg OPDS"
+    kind == DiscoverySourceKind.OPDS -> "Custom OPDS"
+    kind == DiscoverySourceKind.HTML -> "Custom website"
     else -> "Unsupported source"
 }

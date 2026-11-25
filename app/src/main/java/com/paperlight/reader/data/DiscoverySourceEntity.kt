@@ -12,7 +12,15 @@ object DiscoverySourceKind {
 
 object DiscoverySourceIds {
     const val STANDARD_EBOOKS = "standard-ebooks"
+    const val NOVELPING = "novelping"
+    /** Retained only to recognize and remove the former built-in during upgrades/restores. */
     const val GUTENBERG = "project-gutenberg"
+    const val LEGACY_GUTENBERG_URL = "https://www.gutenberg.org/ebooks/search.opds/"
+    val BUILT_INS = setOf(STANDARD_EBOOKS, NOVELPING)
+
+    fun isRemovedGutenbergBuiltin(source: DiscoverySourceEntity): Boolean =
+        source.id == GUTENBERG && source.kind == DiscoverySourceKind.GUTENBERG &&
+            source.baseUrl.equals(LEGACY_GUTENBERG_URL, ignoreCase = true)
 }
 
 @Entity(tableName = "discovery_sources")
