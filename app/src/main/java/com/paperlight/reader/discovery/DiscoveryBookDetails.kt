@@ -14,12 +14,14 @@ import org.jsoup.nodes.Element
 data class DiscoveryBookDetails(
     val synopsis: String?,
     val genres: List<String>,
+    val coverUrl: String? = null,
 )
 
 object DiscoveryBookDetailsClient {
     private const val MAX_SYNOPSIS_CHARS = 12_000
     private const val MAX_GENRES = 24
     private const val MAX_GENRE_CHARS = 80
+    private const val MAX_IMAGE_URL_CHARS = 4_096
 
     suspend fun load(
         source: DiscoverySourceEntity,
@@ -46,18 +48,24 @@ object DiscoveryBookDetailsClient {
             url = book.detailsUrl,
             renderJavaScript = useRenderer,
             renderedContext = renderedContext,
-            ready = ::hasPotentialDetails,
+            ready = { document -> hasPotentialDetails(document, book.title) },
         )
         currentCoroutineContext().ensureActive()
         if (!DiscoveryCatalogClient.sameOrigin(source.baseUrl, fetched.finalUrl) ||
             !isHtmlContentType(fetched.contentType, allowMissing = useRenderer)
         ) return@withContext emptyDetails()
-        parse(fetched.document, source.kind)
+        parse(fetched.document, source.kind, fetched.finalUrl, book.title)
     }
 
-    internal fun parse(document: Document, sourceKind: String? = null): DiscoveryBookDetails = DiscoveryBookDetails(
+    internal fun parse(
+        document: Document,
+        sourceKind: String? = null,
+        pageUrl: String = document.location(),
+        bookTitle: String? = null,
+    ): DiscoveryBookDetails = DiscoveryBookDetails(
         synopsis = extractSynopsis(document)?.let { cleanSynopsis(it, sourceKind) },
         genres = extractGenres(document),
+        coverUrl = extractCoverUrl(document, pageUrl, bookTitle),
     )
 
     private fun isDownloadOnly(book: DiscoveryBook): Boolean {
@@ -72,9 +80,10 @@ object DiscoveryBookDetailsClient {
         return mime in setOf("text/html", "application/xhtml+xml") || (allowMissing && mime.isBlank())
     }
 
-    private fun hasPotentialDetails(document: Document): Boolean =
+    private fun hasPotentialDetails(document: Document, bookTitle: String): Boolean =
         document.select("#novel-description-content, [itemprop=description], [itemprop=abstract], #synopsis, .synopsis, #description, .description").isNotEmpty() ||
-            document.select("[itemprop=genre], a.meta-chip[href*=genre], .genres a, .genre a").isNotEmpty()
+            document.select("[itemprop=genre], a.meta-chip[href*=genre], .genres a, .genre a").isNotEmpty() ||
+            extractCoverUrl(document, document.location(), bookTitle) != null
 
     private fun extractSynopsis(document: Document): String? {
         val selectors = listOf(
@@ -125,6 +134,43 @@ object DiscoveryBookDetailsClient {
         }
         return values.values.take(MAX_GENRES)
     }
+
+    private fun extractCoverUrl(document: Document, pageUrl: String, bookTitle: String?): String? {
+        val metadataImages = document.select(
+            "meta[property=og:image][content], meta[name=twitter:image][content], meta[itemprop=image][content]"
+        )
+        metadataImages.forEach { image -> resolveImageUrl(image.attr("content"), pageUrl)?.let { return it } }
+        document.select("link[rel=image_src][href]").forEach { image ->
+            resolveImageUrl(image.attr("href"), pageUrl)?.let { return it }
+        }
+
+        val images = linkedSetOf<Element>()
+        document.select("img[itemprop=image], img[class*=cover], img[id*=cover], .cover img, .book-cover img, .novel-cover img")
+            .forEach(images::add)
+        val normalizedTitle = bookTitle?.let(::normalizeText).orEmpty()
+        if (normalizedTitle.isNotBlank()) {
+            document.select("img[alt]").filter { image ->
+                val alt = normalizeText(image.attr("alt"))
+                alt == normalizedTitle || alt.removeSuffix(" cover").trim() == normalizedTitle
+            }.forEach(images::add)
+        }
+        images.forEach { image ->
+            DiscoveryCatalogClient.imageUrl(image, pageUrl)?.let { return it }
+        }
+        return null
+    }
+
+    private fun resolveImageUrl(raw: String, pageUrl: String): String? = runCatching {
+        if (raw.isBlank() || raw.length > MAX_IMAGE_URL_CHARS || raw.startsWith("data:", true) ||
+            raw.startsWith("blob:", true) || raw.startsWith("javascript:", true)
+        ) return null
+        val resolved = URI(pageUrl).resolve(raw).normalize()
+        require((resolved.scheme.equals("http", true) || resolved.scheme.equals("https", true)) &&
+            !resolved.host.isNullOrBlank() && resolved.userInfo == null && resolved.toString().length <= MAX_IMAGE_URL_CHARS)
+        resolved.toString()
+    }.getOrNull()
+
+    private fun normalizeText(value: String): String = value.lowercase().replace(Regex("\\s+"), " ").trim()
 
     private fun cleanSynopsis(value: String, sourceKind: String?): String {
         val cleaned = if (sourceKind == DiscoverySourceKind.STANDARD_EBOOKS) {

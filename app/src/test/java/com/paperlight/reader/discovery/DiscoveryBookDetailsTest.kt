@@ -27,6 +27,7 @@ class DiscoveryBookDetailsTest {
               <meta itemprop="description" content="Short metadata summary…">
               <meta itemprop="genre" content="https://novelping.com/novelping-genres/fan-fiction">
               <meta itemprop="genre" content="https://novelping.com/novelping-genres/system">
+              <meta property="og:image" content="https://images.novelping.com/novel/example-cover.jpg?v=1">
             </head><body>
               <div class="book-meta">
                 <a class="btn meta-chip" href="https://novelping.com/novelping-genres/fan-fiction">Fan-fiction</a>
@@ -48,6 +49,7 @@ class DiscoveryBookDetailsTest {
             details.synopsis,
         )
         assertEquals(listOf("Fan fiction", "System"), details.genres)
+        assertEquals("https://images.novelping.com/novel/example-cover.jpg?v=1", details.coverUrl)
     }
 
     @Test fun fallsBackToCommonSynopsisAndGenreMetadata() {
@@ -68,17 +70,52 @@ class DiscoveryBookDetailsTest {
 
     @Test fun cleansStandardEbooksDownloadBoilerplateFromItsSynopsisMetadata() {
         val html = """
-            <html><head><meta name="description" content="Free epub ebook download of the Standard Ebooks edition of Pride and Prejudice: A Regency-era novel of manners in which five women adjust to a new neighbor."></head>
+            <html><head>
+              <meta name="description" content="Free epub ebook download of the Standard Ebooks edition of Pride and Prejudice: A Regency-era novel of manners in which five women adjust to a new neighbor.">
+              <meta property="og:image" content="/ebooks/jane-austen/pride-and-prejudice/downloads/cover.jpg">
+            </head>
             <body><main>No genres listed.</main></body></html>
         """.trimIndent()
 
-        val details = DiscoveryBookDetailsClient.parse(Jsoup.parse(html), DiscoverySourceKind.STANDARD_EBOOKS)
+        val pageUrl = "https://standardebooks.org/ebooks/jane-austen/pride-and-prejudice"
+        val details = DiscoveryBookDetailsClient.parse(Jsoup.parse(html, pageUrl), DiscoverySourceKind.STANDARD_EBOOKS, pageUrl)
 
         assertEquals(
             "A Regency-era novel of manners in which five women adjust to a new neighbor.",
             details.synopsis,
         )
         assertTrue(details.genres.isEmpty())
+        assertEquals("https://standardebooks.org/ebooks/jane-austen/pride-and-prejudice/downloads/cover.jpg", details.coverUrl)
+    }
+
+    @Test fun resolvesLazyPictureSourceSetsAndRejectsNonHttpCoverUrls() {
+        val html = """
+            <html><body>
+              <picture>
+                <source data-srcset="data:image/avif;base64,AAAA 1x, /covers/book@2x.avif 2x">
+                <img class="novel-cover" src="data:image/gif;base64,AA">
+              </picture>
+            </body></html>
+        """.trimIndent()
+        val pageUrl = "https://books.example/novels/example"
+
+        val details = DiscoveryBookDetailsClient.parse(Jsoup.parse(html, pageUrl), pageUrl = pageUrl)
+        val dataOnly = DiscoveryBookDetailsClient.parse(
+            Jsoup.parse("<img class='cover' src='javascript:alert(1)'>", pageUrl), pageUrl = pageUrl)
+
+        assertEquals("https://books.example/covers/book@2x.avif", details.coverUrl)
+        assertEquals(null, dataOnly.coverUrl)
+    }
+
+    @Test fun lazyCoverSourceTakesPriorityOverAnHttpPlaceholder() {
+        val html = """
+            <html><body><img class="book-cover" src="/images/no-cover.png" data-src="/covers/actual-book.jpg"></body></html>
+        """.trimIndent()
+        val pageUrl = "https://books.example/novels/example"
+
+        val details = DiscoveryBookDetailsClient.parse(Jsoup.parse(html, pageUrl), pageUrl = pageUrl)
+
+        assertEquals("https://books.example/covers/actual-book.jpg", details.coverUrl)
     }
 
     @Test fun synopsisAndGenresAreBoundedAndDeduplicated() {

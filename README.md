@@ -7,7 +7,7 @@ Vibe Reader is an Android ebook library and reader. Books are imported into app-
 - Read EPUB, PDF, TXT, MOBI, AZW/AZW3, CBZ, and CBR books. DRM-protected books and KFX are not supported.
 - Organize books in named libraries; search, sort, filter, and track reading progress.
 - Use EPUB contents, bookmarks, highlights, notes, text search, text-to-speech, adjustable reading controls, and accessibility settings. PDF and comics support page navigation and zoom.
-- Discover with a cover-forward Standard Ebooks shelf, Latest/Popular/Browse controls, title/author search, and tappable synopsis/genre details. Optional Project Gutenberg and custom OPDS/HTML catalogs use the same separate Add action.
+- Discover with a cover-forward Standard Ebooks shelf, Latest/Popular/Browse controls, title/author search, and tappable synopsis/genre details with covers. Switch every source between grid and list with a shared setting that persists across launches. Optional Project Gutenberg and custom OPDS/HTML catalogs use the same separate Add action.
 - Choose whether a custom source's Add downloads an available EPUB or opens Website to EPUB. Configure HTML book-list selectors with editable Groq suggestions, same-site search/latest/popular URLs, and converter scraper settings saved per website. Cover thumbnails use bounded in-memory caches, and local book covers appear in library rows.
 - Queue website-to-EPUB conversions, pause/resume/cancel them, and recover from interruptions using saved chapter checkpoints. Android may delay background work.
 - Back up and restore books, reading data, settings, discovery sources, and conversion checkpoints. Export a book in its original format or share its original file. Including the Groq API key in a backup requires a password and encrypts the key.
@@ -36,7 +36,7 @@ Both variants use the same application ID, `com.paperlight.reader`. Android will
 
 For a signed release, configure the four Android keystore secrets (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`) and `ANDROID_EXPECTED_CERT_SHA256`. Trusted pushes to `main` or `anthonys1998-Groq` can produce a release when those values are present. A manual signed-release request must be dispatched from one of those branches; it requires the same values and fails clearly when they are missing or invalid. The APK signer must match the configured expected fingerprint. Release version codes must be greater than 106 and greater than the version code of any installed APK you intend to update. The workflow does not pin the signer to the older run 66 debug artifact. Pull requests do not receive signing secrets.
 
-The latest recorded CI run passed unit tests and the debug build, but APK installation, signed-release production, background scheduling, and behavior on physical devices have not been verified here.
+The latest recorded CI run passed unit tests and the debug build. The later Discover cover-fallback and shared-layout refinements in the current working tree have not yet been validated by CI. APK installation, signed-release production, background scheduling, and behavior on physical devices remain unverified here.
 
 ## Data and privacy
 

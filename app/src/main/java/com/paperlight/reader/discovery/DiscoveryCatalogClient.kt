@@ -128,7 +128,7 @@ object DiscoverySourceConfigCodec {
 
 object DiscoveryCatalogCache {
     fun key(source: DiscoverySourceEntity, query: String, mode: String, pageUrl: String?): String {
-        val raw = listOf(source.id, source.kind, source.baseUrl, source.configJson, query.trim(), mode, pageUrl.orEmpty())
+        val raw = listOf("catalog-parser-v2", source.id, source.kind, source.baseUrl, source.configJson, query.trim(), mode, pageUrl.orEmpty())
             .joinToString("\n")
         return MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
@@ -222,8 +222,8 @@ object DiscoveryCatalogClient {
         require(!looksLikeOpds(document, "")) {
             "AI book-list selector setup is for HTML sources. OPDS catalogs do not need CSS selectors."
         }
-        val sampleConfig = if (usesDefaultHtmlSelectors(currentConfig)) detectHtmlSource(document, finalUrl).config
-            else currentConfig
+        val sampleConfig = novelPingLayout(finalUrl)?.let { novelPingConfig(document, finalUrl, currentConfig, it) }
+            ?: if (usesDefaultHtmlSelectors(currentConfig)) detectHtmlSource(document, finalUrl).config else currentConfig
         val sample = sanitizedCatalogSample(document, sampleConfig)
         require(sample.isNotBlank()) { "This page has no public HTML to configure." }
         DiscoveryHtmlAiSample(finalUrl, sample)
@@ -413,10 +413,10 @@ object DiscoveryCatalogClient {
             if (now - lastScanAt < 750L) return@load false
             lastScanAt = now
             val finalUrl = validateRenderedDocument(document)
-            val currentConfig = if (usesDefaultHtmlSelectors(config)) detectHtmlSource(document, finalUrl).config
-                else config
+            val currentConfig = novelPingLayout(finalUrl)?.let { novelPingConfig(document, finalUrl, config, it) }
+                ?: if (usesDefaultHtmlSelectors(config)) detectHtmlSource(document, finalUrl).config else config
             val activeConfig = mergeDetectedHtmlConfig(config, currentConfig).copy(renderJavaScript = true)
-            val page = runCatching { parseHtmlList(document.outerHtml(), finalUrl, activeConfig, query) }
+            val page = runCatching { parseHtmlWithAutoDetection(document, finalUrl, activeConfig, query) }
                 .getOrElse { failure -> if (!usesDefaultHtmlSelectors(config)) throw failure else null }
             if (page == null || page.books.isEmpty()) false else {
                 loadedPage = page
@@ -470,6 +470,7 @@ object DiscoveryCatalogClient {
 
     internal fun parseHtmlWithAutoDetection(document: Document, finalUrl: String, config: DiscoverySourceConfig,
         query: String): DiscoveryPage {
+        parseNovelPingListing(document, finalUrl, config, query)?.let { return it }
         val initial = runCatching { parseHtmlList(document.outerHtml(), finalUrl, config, query) }.getOrNull()
         val hasSearchResultsScope = query.isNotBlank() &&
             document.selectFirst("[data-search-results], #search-results") != null
@@ -492,6 +493,160 @@ object DiscoveryCatalogClient {
             parseHtmlList(document.outerHtml(), finalUrl, config, query)
         val activeConfig = mergeDetectedHtmlConfig(config, detected.config).copy(renderJavaScript = config.renderJavaScript)
         return parseHtmlList(document.outerHtml(), finalUrl, activeConfig, query).copy(detectedConfig = activeConfig)
+    }
+
+    private data class NovelPingLayout(
+        val scopeSelector: String,
+        val bookSelector: String,
+        val titleSelector: String,
+        val authorSelector: String,
+        val detailsSelector: String,
+        val coverSelector: String,
+        val isHome: Boolean = false,
+    )
+
+    private fun novelPingLayout(url: String): NovelPingLayout? = runCatching {
+        val uri = URI(url)
+        val host = uri.host?.lowercase().orEmpty()
+        if (host != "novelping.com" && !host.endsWith(".novelping.com")) return null
+        when {
+            uri.path.isNullOrBlank() || uri.path == "/" -> NovelPingLayout(
+                scopeSelector = "#index-novel-hot .index-novel",
+                bookSelector = ".item:has(.title h3)",
+                titleSelector = ".title h3",
+                authorSelector = "",
+                detailsSelector = "a[href]",
+                coverSelector = "img.item-img, picture source",
+                isHome = true,
+            )
+            uri.path == "/search" -> NovelPingLayout(
+                scopeSelector = "#search-results[data-search-results], #search-results",
+                bookSelector = ".row:has(h3.novel-title a[href])",
+                titleSelector = "h3.novel-title",
+                authorSelector = "span.author",
+                detailsSelector = "h3.novel-title a[href]",
+                coverSelector = "img.cover, picture source",
+            )
+            uri.path.startsWith("/sort/") -> NovelPingLayout(
+                scopeSelector = "#list-page .col-novel-main .list.list-novel",
+                bookSelector = ".row:has(h3.novel-title a[href])",
+                titleSelector = "h3.novel-title",
+                authorSelector = "span.author",
+                detailsSelector = "h3.novel-title a[href]",
+                coverSelector = "img.cover, picture source",
+            )
+            else -> null
+        }
+    }.getOrNull()
+
+    private fun novelPingConfig(
+        document: Document,
+        finalUrl: String,
+        existing: DiscoverySourceConfig,
+        layout: NovelPingLayout,
+    ): DiscoverySourceConfig {
+        val origin = runCatching {
+            val uri = URI(finalUrl)
+            "${uri.scheme}://${uri.rawAuthority}"
+        }.getOrDefault("https://novelping.com")
+        return existing.copy(
+            htmlBookSelector = layout.bookSelector,
+            htmlTitleSelector = layout.titleSelector,
+            htmlAuthorSelector = layout.authorSelector,
+            htmlDetailLinkSelector = layout.detailsSelector,
+            htmlCoverSelector = layout.coverSelector,
+            searchUrlTemplate = existing.searchUrlTemplate.ifBlank { "$origin/search?keyword={searchTerms}" },
+            htmlLatestUrl = existing.htmlLatestUrl.ifBlank { "$origin/sort/updates" },
+            htmlPopularUrl = existing.htmlPopularUrl.ifBlank { "$origin/sort/hot" },
+            excludeNonCatalogRegions = true,
+        )
+    }
+
+    private fun parseNovelPingListing(
+        document: Document,
+        finalUrl: String,
+        config: DiscoverySourceConfig,
+        query: String,
+    ): DiscoveryPage? {
+        val layout = novelPingLayout(finalUrl) ?: return null
+        val root = document.selectFirst(layout.scopeSelector) ?: return null
+        val current = runCatching {
+            parseHtmlList(root.outerHtml(), finalUrl, config, query)
+        }.getOrNull()?.filterNovelPingBooks()
+        val preferredHasCovers = current?.books?.any { it.coverUrl != null } == true
+        if (current != null && current.books.isNotEmpty() && (!layout.isHome || preferredHasCovers)) {
+            return current.copy(nextUrl = nextPageLink(document)?.attr("href")?.let { safeResolve(finalUrl, it) })
+        }
+
+        val fallbackConfig = novelPingConfig(document, finalUrl, config, layout)
+        val detected = runCatching {
+            parseHtmlList(root.outerHtml(), finalUrl, fallbackConfig, query)
+        }.getOrNull()?.filterNovelPingBooks()
+        if (detected != null && detected.books.isNotEmpty()) {
+            return detected.copy(
+                nextUrl = nextPageLink(document)?.attr("href")?.let { safeResolve(finalUrl, it) },
+            )
+        }
+        if (query.isNotBlank() && layout.scopeSelector.contains("search-results")) {
+            return DiscoveryPage(emptyList(), nextUrl = nextPageLink(document)?.attr("href")
+                ?.let { safeResolve(finalUrl, it) })
+        }
+        return current?.copy(nextUrl = nextPageLink(document)?.attr("href")?.let { safeResolve(finalUrl, it) })
+            ?: DiscoveryPage(emptyList(), nextUrl = nextPageLink(document)?.attr("href")?.let { safeResolve(finalUrl, it) })
+    }
+
+    private fun DiscoveryPage.filterNovelPingBooks(): DiscoveryPage = copy(
+        books = books.filter { book ->
+            runCatching {
+                val uri = URI(book.detailsUrl)
+                uri.host.equals("novelping.com", true) || uri.host.endsWith(".novelping.com", true)
+            }.getOrDefault(false) && runCatching {
+                URI(book.detailsUrl).path.matches(Regex("/book/[^/]+/?"))
+            }.getOrDefault(false)
+        },
+    )
+
+    private fun parseNovelPingScope(
+        root: Element,
+        document: Document,
+        finalUrl: String,
+        config: DiscoverySourceConfig,
+        layout: NovelPingLayout,
+        query: String,
+    ): DiscoveryPage = parseHtmlList(root.outerHtml(), finalUrl, config, query).filterNovelPingBooks().copy(
+        nextUrl = nextPageLink(document)?.attr("href")?.let { safeResolve(finalUrl, it) },
+    )
+
+    private fun srcsetEntries(value: String): List<Pair<String, String>> {
+        val candidates = mutableListOf<Pair<String, String>>()
+        var index = 0
+        while (index < value.length) {
+            while (index < value.length && (value[index].isWhitespace() || value[index] == ',')) index++
+            if (index >= value.length) break
+            val start = index
+            while (index < value.length && !value[index].isWhitespace()) index++
+            val token = value.substring(start, index)
+            val endedWithComma = token.endsWith(',')
+            val url = token.trimEnd(',')
+            var descriptor = ""
+            if (!endedWithComma) {
+                while (index < value.length && value[index].isWhitespace()) index++
+                val descriptorStart = index
+                while (index < value.length && value[index] != ',') index++
+                descriptor = value.substring(descriptorStart, index).trim()
+            }
+            if (url.isNotBlank() && !url.startsWith("data:", true) && !url.startsWith("blob:", true)) {
+                candidates += url to descriptor
+            }
+            if (!endedWithComma && index < value.length && value[index] == ',') index++
+        }
+        return candidates
+    }
+
+    private fun sanitizeSrcset(value: String): String = srcsetEntries(value).joinToString(", ") { (candidate, descriptor) ->
+        val path = runCatching { URI(candidate).rawPath }.getOrNull()
+            ?.takeIf(String::isNotBlank)?.take(240) ?: "/"
+        if (descriptor.isBlank()) path else "$path ${descriptor.take(24)}"
     }
 
     private fun mergeDetectedHtmlConfig(existing: DiscoverySourceConfig, detected: DiscoverySourceConfig): DiscoverySourceConfig =
@@ -525,6 +680,16 @@ object DiscoveryCatalogClient {
 
     internal fun detectHtmlSource(document: Document, finalUrl: String): HtmlSourceDetection {
         requirePublicCatalogDocument(document)
+        novelPingLayout(finalUrl)?.let { layout ->
+            val root = document.selectFirst(layout.scopeSelector)
+            if (root != null) {
+                val config = novelPingConfig(document, finalUrl, DiscoverySourceConfig(), layout)
+                val preview = runCatching {
+                    parseNovelPingScope(root, document, finalUrl, config, layout, "").books.take(4).map { it.title }
+                }.getOrDefault(emptyList())
+                if (preview.isNotEmpty()) return HtmlSourceDetection(config, preview)
+            }
+        }
         val defaults = DiscoverySourceConfig()
         val candidates = linkedMapOf<String, MutableList<Element>>()
         val scanned = document.getAllElements().take(20_000)
@@ -566,7 +731,7 @@ object DiscoveryCatalogClient {
             if ((!semantic && cards.size < 2) || uniqueLinks.isEmpty() || (!semantic && uniqueLinks.size < 2)) return@mapNotNull null
             val score = cards.size.coerceAtMost(24) * 10 +
                 (if (Regex("book|ebook|novel|volume|catalog|search[- ]?result|listing", RegexOption.IGNORE_CASE).containsMatchIn(selector)) 120 else 0) +
-                cards.count { it.selectFirst("img[src], img[data-src], img[data-original], img[srcset], img[data-srcset]") != null } * 2 +
+                cards.count { it.selectFirst("img[src], img[data-src], img[data-lazy-src], img[data-original], img[data-image], img[data-cover], img[srcset], img[data-srcset], picture source[srcset], picture source[data-srcset]") != null } * 2 +
                 cards.count { it.selectFirst("h1, h2, h3, h4, [itemprop=name]") != null } * 3
             Triple(selector, cards.take(24), score)
         }.maxByOrNull { it.third }
@@ -597,7 +762,7 @@ object DiscoveryCatalogClient {
                 item.attr("itemprop").contains("author", true) || item.classNames().any { it.contains("author", true) ||
                     it.contains("byline", true) || it.contains("writer", true) }
             }?.let(::elementCssSelector).orEmpty()
-            val cover = first.selectFirst("img[src], img[data-src], img[data-original], img[srcset], img[data-srcset]")
+            val cover = first.selectFirst("img[src], img[data-src], img[data-lazy-src], img[data-original], img[data-image], img[data-cover], img[srcset], img[data-srcset], picture source[srcset], picture source[data-srcset]")
                 ?.let(::elementCssSelector).orEmpty()
             if (titleSelector.isNotBlank() && linkSelector.isNotBlank()) {
                 config = config.copy(htmlBookSelector = chosen.first, htmlTitleSelector = titleSelector,
@@ -673,14 +838,27 @@ object DiscoveryCatalogClient {
         }
     }
 
-    private fun imageUrl(element: Element, baseUrl: String): String? {
-        val srcset = listOf("srcset", "data-srcset").firstNotNullOfOrNull { key ->
-            element.attr(key).takeIf(String::isNotBlank)?.substringBefore(",")?.trim()?.substringBefore(" ")
-        }.orEmpty()
-        val rawValues = listOf("data-src", "data-original", "data-lazy-src", "data-lazy")
-            .mapNotNull { key -> element.attr(key).takeIf(String::isNotBlank) } +
-            listOf(srcset, element.attr("src").takeIf(String::isNotBlank).orEmpty()).filter(String::isNotBlank)
-        return rawValues.firstNotNullOfOrNull { value -> safeResolve(baseUrl, value) }
+    internal fun imageUrl(element: Element, baseUrl: String): String? {
+        val picture = if (element.normalName().equals("picture", true)) element
+            else element.parents().firstOrNull { it.normalName().equals("picture", true) }
+        val targets = buildList {
+            if (picture != null) addAll(picture.select("source, img"))
+            if (none { it === element }) add(element)
+        }
+        val directAttributes = listOf("data-src", "data-lazy-src", "data-original", "data-image", "data-cover", "data-lazy", "src")
+        val srcsetAttributes = listOf("data-srcset", "srcset")
+        for (target in targets) {
+            for (attribute in directAttributes) {
+                val raw = target.attr(attribute).trim()
+                if (raw.isNotBlank()) safeResolve(baseUrl, raw)?.let { return it }
+            }
+            for (attribute in srcsetAttributes) {
+                for ((candidate, _) in srcsetEntries(target.attr(attribute))) {
+                    safeResolve(baseUrl, candidate)?.let { return it }
+                }
+            }
+        }
+        return null
     }
 
     private fun findHtmlModeUrl(document: Document, baseUrl: String, pattern: Regex): String? =
@@ -846,21 +1024,26 @@ object DiscoveryCatalogClient {
 
     internal fun sanitizedCatalogSample(document: Document, config: DiscoverySourceConfig): String {
         val sanitized = document.clone()
-        val cards = runCatching { sanitized.select(config.htmlBookSelector).take(8) }.getOrDefault(emptyList())
+        val listingRoot = novelPingLayout(document.baseUri())?.let { sanitized.selectFirst(it.scopeSelector) } ?: sanitized
+        val cards = runCatching { listingRoot.select(config.htmlBookSelector).take(8) }.getOrDefault(emptyList())
         val sample = if (cards.isNotEmpty())
             Jsoup.parseBodyFragment(cards.joinToString("\n") { it.outerHtml() }, document.baseUri())
         else sanitized
-        sample.select("script, style, noscript, svg, iframe, object, embed, form, nav, footer, header, aside, video, audio, source, link, meta").remove()
+        sample.select("script, style, noscript, svg, iframe, object, embed, form, nav, footer, header, aside, video, audio, link, meta").remove()
         sample.select("*").forEach { element ->
-            val allowed = setOf("class", "id", "role", "itemprop", "itemtype", "typeof", "property", "rel", "href", "src", "title")
+            val allowed = setOf("class", "id", "role", "itemprop", "itemtype", "typeof", "property", "rel", "href", "src", "srcset", "title")
             element.attributes().asList().map { it.key }.forEach { key ->
                 val safeDataAttribute = key.startsWith("data-") || key.startsWith("aria-")
                 if (key !in allowed && !safeDataAttribute) {
                     element.removeAttr(key)
-                } else if (key == "href" || key == "src" || key.endsWith("-src") || key.endsWith("-href")) {
+                } else if (key == "srcset" || key == "data-srcset") {
+                    val sanitizedSet = sanitizeSrcset(element.attr(key))
+                    if (sanitizedSet.isBlank()) element.removeAttr(key) else element.attr(key, sanitizedSet)
+                } else if (key in setOf("href", "src", "data-src", "data-lazy-src", "data-original", "data-image", "data-cover", "data-lazy")) {
                     val raw = element.attr(key)
-                    val path = runCatching { URI(raw).rawPath }.getOrNull()
-                    if (path.isNullOrBlank()) element.attr(key, if (raw.startsWith("#")) "#" else "/")
+                    val path = if (raw.startsWith("data:", true) || raw.startsWith("blob:", true)) null
+                        else runCatching { URI(raw).rawPath }.getOrNull()
+                    if (path.isNullOrBlank()) element.removeAttr(key)
                     else element.attr(key, path.take(240))
                 } else if (element.attr(key).length > 240) {
                     element.attr(key, element.attr(key).take(240))

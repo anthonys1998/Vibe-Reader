@@ -76,7 +76,11 @@ internal fun BookDiscoveryScreen(
     onRequestGroqKey: () -> Unit,
 ) {
     val context = LocalContext.current
+    val discoveryPreferences = remember(context) { context.getSharedPreferences("discoveryAppearance", 0) }
     val scope = rememberCoroutineScope()
+    var gridLayout by rememberSaveable {
+        mutableStateOf(discoveryPreferences.getBoolean("catalogGridLayout", true))
+    }
     var query by rememberSaveable { mutableStateOf("") }
     var selectedSourceId by rememberSaveable { mutableStateOf(DiscoverySourceIds.STANDARD_EBOOKS) }
     var requestStateSourceId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -521,7 +525,24 @@ internal fun BookDiscoveryScreen(
                             Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    if (selectedSource?.kind == DiscoverySourceKind.STANDARD_EBOOKS) {
+                    if (selectedSource != null) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(top = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text("Layout", style = MaterialTheme.typography.labelLarge)
+                            FilterChip(selected = gridLayout, enabled = downloadingId == null, onClick = {
+                                gridLayout = true
+                                discoveryPreferences.edit().putBoolean("catalogGridLayout", true).apply()
+                            }, label = { Text("Grid") })
+                            FilterChip(selected = !gridLayout, enabled = downloadingId == null, onClick = {
+                                gridLayout = false
+                                discoveryPreferences.edit().putBoolean("catalogGridLayout", false).apply()
+                            }, label = { Text("List") })
+                        }
+                    }
+                    if (gridLayout) {
                         LazyVerticalGrid(
                             columns = GridCells.Adaptive(150.dp),
                             modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -551,7 +572,7 @@ internal fun BookDiscoveryScreen(
                             }
                             shown?.books?.let { books ->
                                 items(books, key = { "book:" + it.id }) { book ->
-                                    StandardEbookCard(
+                                    DiscoveryGridBookCard(
                                         book = book,
                                         adding = downloadingId == book.id,
                                         enabled = downloadingId == null,
@@ -628,6 +649,10 @@ internal fun BookDiscoveryScreen(
                     Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        DiscoveryCover(book.coverUrl, book.title,
+                            Modifier.size(width = 136.dp, height = 190.dp), fallbackUrl = bookDetails?.coverUrl)
+                    }
                     Text(book.author.ifBlank { sourceHost(book.detailsUrl) },
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -675,7 +700,8 @@ internal fun BookDiscoveryScreen(
                         editorUrl = it.take(4096)
                         editorDetected = false
                         editorPreviewTitles = emptyList()
-                    }, enabled = !detecting, label = { Text("Source URL") }, singleLine = true)
+                    }, enabled = !detecting, label = { Text("Source URL") }, singleLine = true,
+                        supportingText = { Text("Use the public page with book cards. Detect, Preview, and Groq suggestions use this URL; for NovelPing, try its alternate listing page if the homepage has no cards.") })
                     Text("Add action", style = MaterialTheme.typography.titleSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
@@ -894,11 +920,31 @@ internal fun BookDiscoveryScreen(
 }
 
 @Composable
-private fun DiscoveryCover(url: String?, title: String, modifier: Modifier = Modifier) {
-    val bitmap by key(url) {
-        produceState<Bitmap?>(DiscoveryCoverMemoryCache.get(url), url) {
-            if (value == null && !url.isNullOrBlank()) {
-                value = loadDiscoveryCover(url)?.also { DiscoveryCoverMemoryCache.put(url, it) }
+private fun DiscoveryCover(
+    url: String?,
+    title: String,
+    modifier: Modifier = Modifier,
+    fallbackUrl: String? = null,
+) {
+    val bitmap by key(url, fallbackUrl) {
+        produceState<Bitmap?>(
+            DiscoveryCoverMemoryCache.get(url) ?: DiscoveryCoverMemoryCache.get(fallbackUrl),
+            url,
+            fallbackUrl,
+        ) {
+            if (value == null) {
+                for (candidate in listOf(url, fallbackUrl).filterNotNull().filter(String::isNotBlank).distinct()) {
+                    val cached = DiscoveryCoverMemoryCache.get(candidate)
+                    if (cached != null) {
+                        value = cached
+                        break
+                    }
+                    val loaded = loadDiscoveryCover(candidate)?.also { DiscoveryCoverMemoryCache.put(candidate, it) }
+                    if (loaded != null) {
+                        value = loaded
+                        break
+                    }
+                }
             }
         }
     }
@@ -910,7 +956,7 @@ private fun DiscoveryCover(url: String?, title: String, modifier: Modifier = Mod
 }
 
 @Composable
-private fun StandardEbookCard(
+private fun DiscoveryGridBookCard(
     book: DiscoveryBook,
     adding: Boolean,
     enabled: Boolean,

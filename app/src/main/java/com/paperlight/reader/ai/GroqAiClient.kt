@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.KeyStore
@@ -119,7 +120,7 @@ class GroqAiClient(private val context: Context) {
     ): DiscoverySourceConfig = withContext(Dispatchers.IO) {
         val sample = DiscoveryCatalogClient.htmlSampleForAi(
             url, currentConfig.renderJavaScript, renderedContext, currentConfig)
-        val prompt = """Configure CSS selectors for the repeated book cards in this public HTML catalog. Return ONLY a JSON object with string fields htmlBookSelector, htmlTitleSelector, htmlAuthorSelector, htmlDetailLinkSelector, htmlCoverSelector, and htmlEpubLinkSelector. htmlBookSelector, htmlTitleSelector, and htmlDetailLinkSelector are required. The other selectors may be empty if absent. Use CSS selectors only, and make title/author/details/cover/download selectors relative to the book card. Do not return JavaScript, URLs to fetch, or explanations.
+        val prompt = """Configure CSS selectors for the repeated book cards in this public HTML catalog. Return ONLY a JSON object with string fields htmlBookSelector, htmlTitleSelector, htmlAuthorSelector, htmlDetailLinkSelector, htmlCoverSelector, and htmlEpubLinkSelector. htmlBookSelector, htmlTitleSelector, and htmlDetailLinkSelector are required. Suggest every optional field that is supported by the sample. If an optional field is absent, return an empty string; do not invent a selector. Use CSS selectors only, and make title/author/details/cover/download selectors relative to the book card. For covers, inspect picture/img/source markup and lazy image attributes such as src, data-src, data-lazy-src, data-original, srcset, and data-srcset; choose the book-cover image rather than a logo or avatar. Do not return JavaScript, URLs to fetch, or explanations.
 HTML SAMPLE:
 ${sample.html}"""
         applyDiscoveryConfigSuggestion(parseJson(request(prompt)), sample.finalUrl, sample.html, currentConfig)
@@ -272,19 +273,78 @@ internal fun applyDiscoveryConfigSuggestion(
     sampleHtml: String,
     currentConfig: DiscoverySourceConfig,
 ): DiscoverySourceConfig {
-    fun selector(field: String, fallback: String = ""): String {
-        val value = json.optString(field, fallback).trim()
+    fun selector(field: String): String {
+        val value = if (json.has(field) && !json.isNull(field)) json.optString(field).trim() else ""
         require(value.length <= 1_000) { "The suggested $field selector exceeds the size limit." }
         return value
+    }
+    fun optionalSelector(field: String, fallback: String): String = selector(field).ifBlank { fallback }
+    fun optionalCoverSelector(): String {
+        val suggested = selector("htmlCoverSelector")
+        if (suggested.isNotBlank()) return suggested
+        val defaultSelector = DiscoverySourceConfig().htmlCoverSelector
+        if (currentConfig.htmlCoverSelector.isNotBlank() && currentConfig.htmlCoverSelector != defaultSelector) {
+            return currentConfig.htmlCoverSelector
+        }
+        return inferCoverSelector(sampleHtml, finalUrl, selector("htmlBookSelector"))
+            .orEmpty()
     }
     val candidate = currentConfig.copy(
         htmlBookSelector = selector("htmlBookSelector"),
         htmlTitleSelector = selector("htmlTitleSelector"),
-        htmlAuthorSelector = selector("htmlAuthorSelector", currentConfig.htmlAuthorSelector),
+        htmlAuthorSelector = optionalSelector("htmlAuthorSelector", currentConfig.htmlAuthorSelector),
         htmlDetailLinkSelector = selector("htmlDetailLinkSelector"),
-        htmlCoverSelector = selector("htmlCoverSelector", currentConfig.htmlCoverSelector),
-        htmlEpubLinkSelector = selector("htmlEpubLinkSelector", currentConfig.htmlEpubLinkSelector),
+        htmlCoverSelector = optionalCoverSelector(),
+        htmlEpubLinkSelector = optionalSelector("htmlEpubLinkSelector", currentConfig.htmlEpubLinkSelector),
     )
     DiscoveryCatalogClient.validateAiDiscoveryConfig(finalUrl, sampleHtml, candidate)
     return candidate
 }
+
+private fun inferCoverSelector(sampleHtml: String, finalUrl: String, bookSelector: String): String? {
+    val document = Jsoup.parse(sampleHtml, finalUrl)
+    val card = runCatching { document.selectFirst(bookSelector) }.getOrNull() ?: return null
+    fun hasImage(element: Element): Boolean = DiscoveryCatalogClient.imageUrl(element, finalUrl) != null
+
+    val semanticImages = runCatching {
+        card.select("img[itemprop=image], img[class*=cover], img[id*=cover], .cover img, .book-cover img, .novel-cover img")
+    }.getOrDefault(emptyList()).filter(::hasImage)
+    if (semanticImages.size == 1) return relativeSelector(card, semanticImages.single())
+    if (semanticImages.size > 1) return null
+
+    val usablePictures = card.select("picture").filter { picture ->
+        picture.select("source, img").any(::hasImage)
+    }
+    if (usablePictures.size == 1) {
+        val picture = usablePictures.single()
+        val sources = picture.select("source").filter(::hasImage)
+        if (sources.isNotEmpty()) return relativeSelector(card, sources.first())
+        val images = picture.select("img").filter(::hasImage)
+        if (images.size == 1) return relativeSelector(card, images.single())
+        return null
+    }
+    if (usablePictures.size > 1) return null
+
+    val standaloneImages = card.select("img").filter { image ->
+        image.parents().none { it.normalName().equals("picture", true) } && hasImage(image)
+    }
+    return standaloneImages.singleOrNull()?.let { relativeSelector(card, it) }
+}
+
+private fun relativeSelector(card: Element, target: Element): String? {
+    val path = mutableListOf<String>()
+    var element: Element? = target
+    while (element != null && element !== card) {
+        val tag = element.normalName().takeIf(String::isNotBlank) ?: return null
+        val classes = element.classNames().filter { CSS_IDENTIFIER.matches(it) }.take(2)
+        var part = tag + classes.joinToString("") { ".$it" }
+        val siblings = element.parent()?.children()?.filter { it.normalName() == tag }.orEmpty()
+        if (siblings.size > 1) part += ":nth-of-type(${siblings.indexOf(element) + 1})"
+        path += part
+        element = element.parent()
+    }
+    if (element !== card || path.isEmpty()) return null
+    return path.asReversed().joinToString(" > ")
+}
+
+private val CSS_IDENTIFIER = Regex("-?[_A-Za-z][-_A-Za-z0-9]*")
