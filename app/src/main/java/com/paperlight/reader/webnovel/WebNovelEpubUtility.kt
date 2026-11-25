@@ -16,10 +16,13 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.URI
 import java.security.MessageDigest
+import java.security.cert.CertPathValidatorException
+import java.security.cert.CertificateException
 import java.time.Duration
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.io.IOException
+import javax.net.ssl.SSLException
 import kotlin.random.Random
 import kotlin.coroutines.coroutineContext
 
@@ -40,6 +43,7 @@ data class WebNovelAiSamples(val tocHtml: String, val chapterHtml: String)
 
 class RateLimitDeferredException(val host: String, val waitUntil: Long) : Exception("The site asked the reader to wait before retrying.")
 class WebNovelWorkerSliceYieldException : Exception("This conversion saved its chapter checkpoint and will continue automatically.")
+private class SecureFetchFallbackException(message: String, cause: Throwable) : IOException(message, cause)
 
 /** Scrapes a user-supplied novel TOC and writes a DRM-free EPUB without blocking the UI dispatcher. */
 class WebNovelEpubUtility(context: Context) {
@@ -193,11 +197,35 @@ class WebNovelEpubUtility(context: Context) {
                 found > 0 && (expected == null || found >= expected)
             }
         } else fetch(start.toString(), onRateLimitWait)
-        val chapterLinks = links(toc)
+        val chapterLinks = novelPingChapterLinks(toc, options, onRateLimitWait) ?: links(toc)
         require(chapterLinks.isNotEmpty()) {
             "No chapter links found. Check the table of contents URL and selectors, or enable browser rendering."
         }
         return toc to chapterLinks
+    }
+
+    private suspend fun novelPingChapterLinks(
+        toc: Document,
+        options: WebNovelScrapeOptions,
+        onRateLimitWait: suspend (String, Long?) -> Unit,
+    ): List<Pair<String, String?>>? {
+        val archiveUrl = NovelPingChapterArchive.urlFor(toc) ?: return null
+        val archiveRequired = toc.selectFirst("#chapter-archive .loading") != null
+        return try {
+            val archive = fetch(archiveUrl, onRateLimitWait)
+            NovelPingChapterArchive.extractLinks(archive, validateHttpUrl(toc.baseUri()), options.chapterLinkSelector)
+                .takeIf { it.isNotEmpty() }
+                ?: if (archiveRequired) error("NovelPing returned an empty chapter archive.") else null
+        } catch (failure: RateLimitDeferredException) {
+            throw failure
+        } catch (failure: kotlinx.coroutines.CancellationException) {
+            throw failure
+        } catch (failure: SecureFetchFallbackException) {
+            throw failure
+        } catch (failure: Exception) {
+            if (archiveRequired) throw IOException("Could not load NovelPing's complete chapter archive.", failure)
+            null
+        }
     }
 
     private fun <T> List<T>.inRange(options: WebNovelScrapeOptions): List<T> {
@@ -266,6 +294,9 @@ class WebNovelEpubUtility(context: Context) {
                     .ignoreHttpErrors(true)
                     .execute()
             } catch (failure: IOException) {
+                if (validateHttpUrl(url).scheme.equals("https", true) && failure.hasTlsFailure()) {
+                    return loadAfterTlsFailure(url, failure)
+                }
                 attempts++
                 if (attempts > MAX_RATE_LIMIT_RETRIES) throw failure
                 persistCooldown(host, retryAfterMillis(null, attempts), onRateLimitWait)
@@ -288,6 +319,31 @@ class WebNovelEpubUtility(context: Context) {
             onRateLimitWait(host, null)
             return response.parse()
         }
+    }
+
+    private suspend fun loadAfterTlsFailure(url: String, directFailure: IOException): Document {
+        val requestedUri = validateHttpUrl(url)
+        return try {
+            val document = renderer.load(url) { it.body()?.text()?.isNotBlank() == true }
+            val finalUri = validateHttpUrl(document.baseUri())
+            require(sameOrigin(requestedUri, finalUri)) {
+                "The secure browser retry redirected to a different origin."
+            }
+            document
+        } catch (retryFailure: kotlinx.coroutines.CancellationException) {
+            throw retryFailure
+        } catch (retryFailure: Exception) {
+            val directMessage = directFailure.message ?: directFailure.javaClass.simpleName
+            val retryMessage = retryFailure.message ?: retryFailure.javaClass.simpleName
+            throw SecureFetchFallbackException(
+                "Secure direct loading failed ($directMessage), and the browser retry failed ($retryMessage).",
+                retryFailure,
+            )
+        }
+    }
+
+    private fun Throwable.hasTlsFailure(): Boolean = generateSequence(this) { it.cause }.any {
+        it is SSLException || it is CertificateException || it is CertPathValidatorException
     }
 
     private suspend fun awaitCooldown(url: String, onRateLimitWait: suspend (String, Long?) -> Unit) {

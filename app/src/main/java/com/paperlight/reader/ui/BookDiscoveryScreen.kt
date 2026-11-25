@@ -7,9 +7,8 @@ import android.util.LruCache
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
@@ -182,7 +181,7 @@ internal fun BookDiscoveryScreen(
         scope.launch {
             try {
                 val preview = DiscoveryCatalogClient.search(previewSource, "", DiscoveryCatalogClient.MODE_BROWSE,
-                    renderedContext = if (editorConfig.renderJavaScript) context.applicationContext else null)
+                    renderedContext = context.applicationContext)
                 editorPreviewTitles = preview.books.take(4).map { it.title }
                 editorError = if (editorPreviewTitles.isEmpty()) "No book cards matched these selectors."
                     else "Previewed ${preview.books.size} books with the current settings."
@@ -228,7 +227,7 @@ internal fun BookDiscoveryScreen(
         loading = true
         try {
             val fresh = DiscoveryCatalogClient.search(source, effectiveQuery, searchMode, effectivePageUrl,
-                renderedContext = if (source.kind == DiscoverySourceKind.HTML && config.renderJavaScript)
+                renderedContext = if (source.kind == DiscoverySourceKind.HTML)
                     context.applicationContext else null)
             if (requestGeneration != token) return@LaunchedEffect
             page = fresh
@@ -263,10 +262,9 @@ internal fun BookDiscoveryScreen(
         bookDetails = null
         detailsError = null
         try {
-            val sourceConfig = DiscoverySourceConfigCodec.decode(source.configJson)
             val loaded = DiscoveryBookDetailsClient.load(
                 source, book,
-                renderedContext = if (source.kind == DiscoverySourceKind.HTML && sourceConfig.renderJavaScript)
+                renderedContext = if (source.kind == DiscoverySourceKind.HTML)
                     context.applicationContext else null,
             )
             if (detailsRequestGeneration == token) bookDetails = loaded
@@ -297,7 +295,7 @@ internal fun BookDiscoveryScreen(
             var transferred = false
             try {
                 DiscoveryCatalogClient.downloadEpub(source, book, temporary,
-                    if (source.kind == DiscoverySourceKind.HTML && DiscoverySourceConfigCodec.decode(source.configJson).renderJavaScript)
+                    if (source.kind == DiscoverySourceKind.HTML)
                         context.applicationContext else null)
                 onImportEpub(temporary, book.title, book.author)
                 transferred = true
@@ -323,21 +321,28 @@ internal fun BookDiscoveryScreen(
         detailsError = null
     }
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { if (manageSources) manageSources = false else onDismiss() }) {
-                Icon(Icons.Rounded.ArrowBack,
-                    contentDescription = if (manageSources) "Back to Discover" else "Back to library")
-            }
-            Text(if (manageSources) "Discovery sources" else "Discover books",
-                Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
-            if (!manageSources) TextButton(enabled = downloadingId == null, onClick = { manageSources = true }) {
-                Icon(Icons.Rounded.Settings, contentDescription = null)
-                Text("Sources")
-            }
-        }
-
-
+    val shown = visiblePage
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(150.dp),
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        contentPadding = PaddingValues(vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            Column(Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { if (manageSources) manageSources = false else onDismiss() }) {
+                        Icon(Icons.Rounded.ArrowBack,
+                            contentDescription = if (manageSources) "Back to Discover" else "Back to library")
+                    }
+                    Text(if (manageSources) "Discovery sources" else "Discover books",
+                        Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                    if (!manageSources) TextButton(enabled = downloadingId == null, onClick = { manageSources = true }) {
+                        Icon(Icons.Rounded.Settings, contentDescription = null)
+                        Text("Sources")
+                    }
+                }
                 if (manageSources) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text("Enable a source to browse. Custom OPDS and HTML sources can be edited or removed.",
@@ -345,61 +350,11 @@ internal fun BookDiscoveryScreen(
                         Button(onClick = { beginEdit() }, enabled = downloadingId == null) { Text("Add source") }
                     }
                     sourceActionError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                    LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(sources, key = { it.id }) { source ->
-                            Card {
-                                Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Column(Modifier.weight(1f)) {
-                                            Text(source.name, style = MaterialTheme.typography.titleSmall)
-                                            Text(sourceKindLabel(source.kind), style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = source.enabled, enabled = downloadingId == null,
-                                            onCheckedChange = { enabled ->
-                                                if (!enabled && selectedSourceId == source.id) {
-                                                    page = null
-                                                    requestedPageUrl = null
-                                                }
-                                                viewModel.setDiscoverySourceEnabled(source.id, enabled) { saved ->
-                                                    if (!saved) sourceActionError = "Could not update this source."
-                                                    else sourceActionError = null
-                                                }
-                                            })
-                                    }
-                                    Text(source.baseUrl, style = MaterialTheme.typography.bodySmall,
-                                        maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                    Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                                        TextButton(onClick = {
-                                            selectedSourceId = source.id
-                                            query = ""
-                                            requestedQuery = ""
-                                            requestedMode = if (source.kind == DiscoverySourceKind.STANDARD_EBOOKS)
-                                                DiscoveryCatalogClient.MODE_LATEST else DiscoveryCatalogClient.MODE_BROWSE
-                                            mode = requestedMode
-                                            requestedPageUrl = null
-                                            browseStack = emptyList()
-                                            manageSources = false
-                                            refreshRevision++
-                                        }, enabled = source.enabled && downloadingId == null) { Text("Browse") }
-                                        if (source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
-                                            IconButton(enabled = downloadingId == null, onClick = { beginEdit(source) }) {
-                                                Icon(Icons.Rounded.Edit, contentDescription = "Edit " + source.name)
-                                            }
-                                            IconButton(enabled = downloadingId == null, onClick = { deleteSource = source }) {
-                                                Icon(Icons.Rounded.Delete, contentDescription = "Remove " + source.name)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Box(Modifier.weight(1f)) {
-                            OutlinedButton(onClick = { sourceMenu = true }, enabled = enabledSources.isNotEmpty() && downloadingId == null,
+                            OutlinedButton(onClick = { sourceMenu = true },
+                                enabled = enabledSources.isNotEmpty() && downloadingId == null,
                                 modifier = Modifier.fillMaxWidth()) {
                                 Text(selectedSource?.name ?: "No enabled sources", Modifier.weight(1f),
                                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -500,8 +455,6 @@ internal fun BookDiscoveryScreen(
                         Text(if (localHtmlFilter) "Search filters this listing. Edit the source to configure site search and Latest or Popular pages."
                             else "Search uses the saved site URL template; Latest and Popular use their saved listing URLs.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    if (selectedSource?.kind == DiscoverySourceKind.HTML) {
                         Text("This listing uses saved CSS selectors. If results are missing, edit or suggest selectors; sign-in sites are unsupported.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         page?.detectedConfig?.let { suggestion ->
@@ -515,7 +468,6 @@ internal fun BookDiscoveryScreen(
                     error?.let { Text(it, color = if (page != null) MaterialTheme.colorScheme.onSurfaceVariant
                         else MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 6.dp),
                         style = MaterialTheme.typography.bodySmall) }
-                    val shown = visiblePage
                     if (loading && shown == null) {
                         Text("Loading ${selectedSource?.name ?: "catalog"}…", Modifier.padding(vertical = 12.dp),
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -526,11 +478,9 @@ internal fun BookDiscoveryScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (selectedSource != null) {
-                        Row(
-                            Modifier.fillMaxWidth().padding(top = 4.dp),
+                        Row(Modifier.fillMaxWidth().padding(top = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("Layout", style = MaterialTheme.typography.labelLarge)
                             FilterChip(selected = gridLayout, enabled = downloadingId == null, onClick = {
                                 gridLayout = true
@@ -542,94 +492,135 @@ internal fun BookDiscoveryScreen(
                             }, label = { Text("List") })
                         }
                     }
-                    if (gridLayout) {
-                        LazyVerticalGrid(
-                            columns = GridCells.Adaptive(150.dp),
-                            modifier = Modifier.weight(1f).fillMaxWidth(),
-                            contentPadding = PaddingValues(vertical = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                        ) {
-                            shown?.collections?.let { collections ->
-                                items(collections, key = { "collection:" + it.url }) { item ->
-                                    Card(modifier = Modifier.fillMaxWidth().clickable(enabled = downloadingId == null) {
-                                        browseStack = browseStack + item
-                                        requestedPageUrl = item.url
-                                        requestedQuery = ""
-                                        refreshRevision++
-                                    }) {
-                                        Column(Modifier.fillMaxWidth().padding(16.dp),
-                                            verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            Icon(Icons.Rounded.Book, contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.primary)
-                                            Text(item.title, style = MaterialTheme.typography.titleSmall,
-                                                maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                            Text("Browse collection", style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
+                }
+            }
+        }
+        if (manageSources) {
+            items(sources, key = { it.id }, span = { GridItemSpan(maxLineSpan) }) { source ->
+                Card {
+                    Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(source.name, style = MaterialTheme.typography.titleSmall)
+                                Text(sourceKindLabel(source.kind), style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Switch(checked = source.enabled, enabled = downloadingId == null,
+                                onCheckedChange = { enabled ->
+                                    if (!enabled && selectedSourceId == source.id) {
+                                        page = null
+                                        requestedPageUrl = null
                                     }
-                                }
-                            }
-                            shown?.books?.let { books ->
-                                items(books, key = { "book:" + it.id }) { book ->
-                                    DiscoveryGridBookCard(
-                                        book = book,
-                                        adding = downloadingId == book.id,
-                                        enabled = downloadingId == null,
-                                        onDetails = { openBookDetails(selectedSource, book) },
-                                        onAdd = { downloadBook(selectedSource, book) },
-                                    )
-                                }
-                            }
+                                    viewModel.setDiscoverySourceEnabled(source.id, enabled) { saved ->
+                                        if (!saved) sourceActionError = "Could not update this source."
+                                        else sourceActionError = null
+                                    }
+                                })
                         }
-                    } else {
-                        LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(vertical = 8.dp)) {
-                            shown?.collections?.let { collections ->
-                                items(collections, key = { "collection:" + it.url }) { item ->
-                                    ListItem(
-                                        headlineContent = { Text(item.title) },
-                                        supportingContent = { Text("Browse collection") },
-                                        trailingContent = { Text("Open") },
-                                        modifier = Modifier.clickable(enabled = downloadingId == null) {
-                                            browseStack = browseStack + item
-                                            requestedPageUrl = item.url
-                                            requestedQuery = ""
-                                            refreshRevision++
-                                        },
-                                    )
-                                    HorizontalDivider()
+                        Text(source.baseUrl, style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                            TextButton(onClick = {
+                                selectedSourceId = source.id
+                                query = ""
+                                requestedQuery = ""
+                                requestedMode = if (source.kind == DiscoverySourceKind.STANDARD_EBOOKS)
+                                    DiscoveryCatalogClient.MODE_LATEST else DiscoveryCatalogClient.MODE_BROWSE
+                                mode = requestedMode
+                                requestedPageUrl = null
+                                browseStack = emptyList()
+                                manageSources = false
+                                refreshRevision++
+                            }, enabled = source.enabled && downloadingId == null) { Text("Browse") }
+                            if (source.id !in setOf(DiscoverySourceIds.STANDARD_EBOOKS, DiscoverySourceIds.GUTENBERG)) {
+                                IconButton(enabled = downloadingId == null, onClick = { beginEdit(source) }) {
+                                    Icon(Icons.Rounded.Edit, contentDescription = "Edit " + source.name)
                                 }
-                            }
-                            shown?.books?.let { books ->
-                                items(books, key = { "book:" + it.id }) { book ->
-                                    ListItem(
-                                        headlineContent = { Text(book.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-                                        supportingContent = { Text(book.author.ifBlank { sourceHost(book.detailsUrl) },
-                                            maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                                        leadingContent = { DiscoveryCover(book.coverUrl, book.title,
-                                            Modifier.size(width = 42.dp, height = 62.dp)) },
-                                        trailingContent = {
-                                            TextButton(enabled = downloadingId == null,
-                                                onClick = { downloadBook(selectedSource, book) }) {
-                                                Text(if (downloadingId == book.id) "Downloading…" else "Add")
-                                            }
-                                        },
-                                        modifier = Modifier.clickable(enabled = downloadingId == null) {
-                                            openBookDetails(selectedSource, book)
-                                        },
-                                    )
-                                    HorizontalDivider()
+                                IconButton(enabled = downloadingId == null, onClick = { deleteSource = source }) {
+                                    Icon(Icons.Rounded.Delete, contentDescription = "Remove " + source.name)
                                 }
                             }
                         }
                     }
-                    shown?.nextUrl?.let { next ->
-                        TextButton(enabled = !loading && downloadingId == null, onClick = {
-                            requestedPageUrl = next
-                            refreshRevision++
-                        }, modifier = Modifier.align(Alignment.End)) { Text("Next page") }
+                }
+            }
+        } else {
+            items(shown?.collections.orEmpty(), key = { "collection:" + it.url },
+                span = { GridItemSpan(if (gridLayout) 1 else maxLineSpan) }) { item ->
+                if (gridLayout) {
+                    Card(modifier = Modifier.fillMaxWidth().clickable(enabled = downloadingId == null) {
+                        browseStack = browseStack + item
+                        requestedPageUrl = item.url
+                        requestedQuery = ""
+                        refreshRevision++
+                    }) {
+                        Column(Modifier.fillMaxWidth().padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Rounded.Book, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Text(item.title, style = MaterialTheme.typography.titleSmall,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text("Browse collection", style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
-    }
+                } else {
+                    Column(Modifier.fillMaxWidth()) {
+                        ListItem(
+                            headlineContent = { Text(item.title) },
+                            supportingContent = { Text("Browse collection") },
+                            trailingContent = { Text("Open") },
+                            modifier = Modifier.clickable(enabled = downloadingId == null) {
+                                browseStack = browseStack + item
+                                requestedPageUrl = item.url
+                                requestedQuery = ""
+                                refreshRevision++
+                            },
+                        )
+                        HorizontalDivider()
+                    }
+                }
+            }
+            items(shown?.books.orEmpty(), key = { "book:" + it.id },
+                span = { GridItemSpan(if (gridLayout) 1 else maxLineSpan) }) { book ->
+                if (gridLayout) {
+                    DiscoveryGridBookCard(
+                        book = book,
+                        adding = downloadingId == book.id,
+                        enabled = downloadingId == null,
+                        onDetails = { openBookDetails(selectedSource, book) },
+                        onAdd = { downloadBook(selectedSource, book) },
+                    )
+                } else {
+                    Column(Modifier.fillMaxWidth()) {
+                        ListItem(
+                            headlineContent = { Text(book.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = { Text(book.author.ifBlank { sourceHost(book.detailsUrl) },
+                                maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            leadingContent = { DiscoveryCover(book.coverUrl, book.title,
+                                Modifier.size(width = 42.dp, height = 62.dp)) },
+                            trailingContent = {
+                                TextButton(enabled = downloadingId == null,
+                                    onClick = { downloadBook(selectedSource, book) }) {
+                                    Text(if (downloadingId == book.id) "Downloading…" else "Add")
+                                }
+                            },
+                            modifier = Modifier.clickable(enabled = downloadingId == null) {
+                                openBookDetails(selectedSource, book)
+                            },
+                        )
+                        HorizontalDivider()
+                    }
+                }
+            }
+            shown?.nextUrl?.let { next ->
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    TextButton(enabled = !loading && downloadingId == null, onClick = {
+                        requestedPageUrl = next
+                        refreshRevision++
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Next page") }
+                }
+            }
+        }
     }
 
     detailsBook?.let { book ->
@@ -738,7 +729,7 @@ internal fun BookDiscoveryScreen(
                         scope.launch {
                             try {
                                 val detected = DiscoveryCatalogClient.detectSource(editorUrl, editorName,
-                                    if (editorConfig.renderJavaScript) context.applicationContext else null,
+                                    context.applicationContext,
                                     editorConfig.renderJavaScript)
                                 if (detected.kind == DiscoverySourceKind.STANDARD_EBOOKS &&
                                     sources.any { it.id == DiscoverySourceIds.STANDARD_EBOOKS }) {
@@ -783,7 +774,7 @@ internal fun BookDiscoveryScreen(
                                             val suggestion = withContext(Dispatchers.IO) {
                                                 GroqAiClient(context).suggestDiscoveryConfig(
                                                     editorUrl.trim(), currentConfig,
-                                                    if (currentConfig.renderJavaScript) context.applicationContext else null)
+                                                    context.applicationContext)
                                             }
                                             editorConfig = currentConfig.copy(
                                                 htmlBookSelector = suggestion.htmlBookSelector,

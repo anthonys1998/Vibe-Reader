@@ -13,7 +13,11 @@ import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
+import java.security.cert.CertPathValidatorException
+import java.security.cert.CertificateException
 import java.util.zip.ZipFile
+import javax.net.ssl.SSLException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -211,7 +215,7 @@ object DiscoveryCatalogClient {
             finalUrl = validateRenderedDocument(rendered)
             document = rendered
         } else {
-            val response = fetchDocument(url)
+            val response = fetchHtmlDocument(url, renderedContext)
             require(!looksLikeOpds(response.document, response.contentType)) {
                 "AI book-list selector setup is for HTML sources. OPDS catalogs do not need CSS selectors."
             }
@@ -236,7 +240,7 @@ object DiscoveryCatalogClient {
         ready: (Document) -> Boolean = { it.body()?.text()?.isNotBlank() == true },
     ): DiscoveryFetchedDocument {
         if (!renderJavaScript) {
-            val fetched = fetchDocument(url)
+            val fetched = fetchHtmlDocument(url, renderedContext)
             requirePublicCatalogDocument(fetched.document)
             return fetched
         }
@@ -287,7 +291,7 @@ object DiscoveryCatalogClient {
 
     suspend fun detectSource(url: String, name: String = "", renderedContext: Context? = null,
         renderJavaScript: Boolean = false): DetectedDiscoverySource = withContext(Dispatchers.IO) {
-        val response = fetchDocument(url)
+        val response = fetchHtmlDocument(url, renderedContext)
         val finalUrl = response.finalUrl
         val originName = name.trim().takeIf(String::isNotBlank) ?: URI(finalUrl).host.orEmpty()
         require(!isUnsupportedOpdsJson(response.contentType)) {
@@ -401,7 +405,7 @@ object DiscoveryCatalogClient {
         val url = pageUrl ?: if (query.isNotBlank() && config.searchUrlTemplate.isNotBlank())
             expandSearchTemplate(config.searchUrlTemplate, query) else modeTarget ?: source.baseUrl
         if (!config.renderJavaScript) {
-            val response = fetchDocument(url)
+            val response = fetchHtmlDocument(url, renderedContext)
             return parseHtmlWithAutoDetection(response.document, response.finalUrl, config, query)
         }
         val context = renderedContext ?: error("Enable the rendered listing in a source opened from Discover.")
@@ -977,7 +981,7 @@ object DiscoveryCatalogClient {
                     it.attr("href").substringBefore('?').endsWith(".epub", true)
                 }
             }
-        } else fetchDocument(detailsUrl).document
+        } else fetchHtmlDocument(detailsUrl, renderedContext).document
         val finalUrl = validateRenderedDocument(document)
         val link = selectFirst(document, config.htmlEpubLinkSelector)
             ?: document.getElementsByTag("a").firstOrNull {
@@ -1080,6 +1084,43 @@ object DiscoveryCatalogClient {
         val parser = if (contentType.contains("xml", true) || contentType.contains("atom", true))
             Parser.xmlParser() else Parser.htmlParser()
         DiscoveryFetchedDocument(Jsoup.parse(response.body(), finalUrl, parser), finalUrl, contentType)
+    }
+
+    private suspend fun fetchHtmlDocument(url: String, fallbackContext: Context?): DiscoveryFetchedDocument {
+        try {
+            return fetchDocument(url)
+        } catch (failure: Exception) {
+            if (failure is CancellationException || !failure.isTlsFailure() || fallbackContext == null) throw failure
+            try {
+                val safeUrl = validateHttpUrl(url)
+                val rendered = RenderedNovelPage(fallbackContext, MAX_CATALOG_BYTES).load(safeUrl) { document ->
+                    requirePublicCatalogDocument(document)
+                    document.body()?.text()?.isNotBlank() == true
+                }
+                val finalUrl = validateRenderedDocument(rendered)
+                require(sameOrigin(safeUrl, finalUrl)) { "The source redirected to another website." }
+                return DiscoveryFetchedDocument(rendered, finalUrl, "text/html")
+            } catch (fallbackFailure: Exception) {
+                if (fallbackFailure is CancellationException) throw fallbackFailure
+                throw IllegalStateException(
+                    "Java could not verify this site’s HTTPS certificate, and the secure browser fallback failed: " +
+                        fallbackFailure.message.orEmpty(),
+                    fallbackFailure,
+                )
+            }
+        }
+    }
+
+    private fun Throwable.isTlsFailure(): Boolean {
+        val visited = mutableSetOf<Throwable>()
+        var current: Throwable? = this
+        while (current != null && visited.add(current)) {
+            if (current is SSLException || current is CertificateException || current is CertPathValidatorException) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
     }
 
     private fun validateHttpUrl(raw: String): String {
