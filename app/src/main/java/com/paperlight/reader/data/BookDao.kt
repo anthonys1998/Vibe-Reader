@@ -250,6 +250,150 @@ interface BookDao {
     @Query("SELECT EXISTS(SELECT 1 FROM web_novel_jobs WHERE runnerToken IS NOT NULL AND status IN ('RUNNING', 'WAITING_RATE_LIMIT', 'PAUSE_REQUESTED', 'CANCEL_REQUESTED'))")
     suspend fun hasActiveWebNovelJob(): Boolean
 
+    @Query("SELECT * FROM pdf_conversion_jobs ORDER BY createdAt DESC")
+    fun observePdfConversionJobs(): Flow<List<PdfConversionJobEntity>>
+
+    @Query("SELECT * FROM pdf_conversion_jobs ORDER BY createdAt")
+    suspend fun allPdfConversionJobs(): List<PdfConversionJobEntity>
+
+    @Query("SELECT * FROM pdf_conversion_jobs WHERE id = :id LIMIT 1")
+    suspend fun pdfConversionJobById(id: String): PdfConversionJobEntity?
+
+    @Query("SELECT * FROM pdf_conversion_jobs WHERE inputHash = :inputHash AND mode = :mode AND optionsJson = :optionsJson AND libraryId = :libraryId AND status != 'CANCELLED' ORDER BY createdAt DESC LIMIT 1")
+    suspend fun matchingPdfConversionJob(inputHash: String, mode: String, optionsJson: String, libraryId: String): PdfConversionJobEntity?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertPdfConversionJob(job: PdfConversionJobEntity)
+
+    @Update
+    suspend fun updatePdfConversionJob(job: PdfConversionJobEntity)
+
+    @Query("SELECT * FROM pdf_conversion_jobs WHERE status = 'QUEUED' ORDER BY createdAt ASC LIMIT 1")
+    suspend fun nextQueuedPdfConversionJob(): PdfConversionJobEntity?
+
+    @Query("SELECT EXISTS(SELECT 1 FROM pdf_conversion_jobs WHERE runnerToken IS NOT NULL AND status IN ('RUNNING', 'PAUSE_REQUESTED', 'CANCEL_REQUESTED'))")
+    suspend fun hasClaimedPdfConversionJob(): Boolean
+
+    @Query("SELECT EXISTS(SELECT 1 FROM pdf_conversion_jobs WHERE runnerToken IS NOT NULL AND status IN ('RUNNING', 'PAUSE_REQUESTED', 'CANCEL_REQUESTED'))")
+    suspend fun hasActivePdfConversionJob(): Boolean
+
+    @Transaction
+    suspend fun claimNextPdfConversionJob(token: String, runnerType: String, now: Long): PdfConversionJobEntity? {
+        if (hasClaimedPdfConversionJob()) return null
+        val queued = nextQueuedPdfConversionJob() ?: return null
+        return queued.copy(status = PdfConversionJobState.RUNNING, stage = "Starting", error = null,
+            runnerToken = token, runnerType = runnerType, updatedAt = now).also { updatePdfConversionJob(it) }
+    }
+
+    @Transaction
+    suspend fun claimRedeliveredPdfConversionJob(id: String, token: String, now: Long): PdfConversionJobEntity? {
+        if (hasClaimedPdfConversionJob()) return null
+        val job = pdfConversionJobById(id) ?: return null
+        if (job.status !in setOf(PdfConversionJobState.QUEUED, PdfConversionJobState.INTERRUPTED)) return null
+        return job.copy(status = PdfConversionJobState.RUNNING, stage = "Resuming", error = null,
+            runnerToken = token, runnerType = "FOREGROUND", updatedAt = now).also { updatePdfConversionJob(it) }
+    }
+
+    @Transaction
+    suspend fun claimAutomaticPdfConversionJob(id: String, token: String, now: Long): PdfConversionJobEntity? {
+        if (hasClaimedPdfConversionJob()) return null
+        val job = pdfConversionJobById(id) ?: return null
+        if (!job.autoRun || job.status !in setOf(PdfConversionJobState.QUEUED, PdfConversionJobState.INTERRUPTED)) return null
+        return job.copy(status = PdfConversionJobState.RUNNING, stage = "Resuming", error = null,
+            runnerToken = token, runnerType = "WORKER", updatedAt = now).also { updatePdfConversionJob(it) }
+    }
+
+    @Query("UPDATE pdf_conversion_jobs SET stage = :stage, completedPages = :completed, totalPages = :total, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status = 'RUNNING'")
+    suspend fun updatePdfConversionJobProgress(id: String, token: String, stage: String, completed: Int,
+        total: Int, now: Long): Int
+
+    @Query("UPDATE pdf_conversion_jobs SET warning = :warning, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status = 'RUNNING'")
+    suspend fun updatePdfConversionJobWarning(id: String, token: String, warning: String?, now: Long): Int
+
+    @Query("UPDATE pdf_conversion_jobs SET status = :status, stage = :stage, error = :error, resultBookId = :resultBookId, runnerToken = NULL, runnerType = NULL, autoRun = 0, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status = 'RUNNING'")
+    suspend fun finishPdfConversionJob(id: String, token: String, status: String, stage: String,
+        error: String?, resultBookId: String, now: Long): Int
+
+    @Transaction
+    suspend fun insertGeneratedPdfBookAndFinish(book: BookEntity, jobId: String, token: String): Boolean {
+        val job = pdfConversionJobById(jobId) ?: return false
+        if (job.runnerToken != token || job.status != PdfConversionJobState.RUNNING) return false
+        require(findLibrary(book.libraryId) != null) { "That library no longer exists." }
+        upsert(book)
+        check(finishPdfConversionJob(jobId, token, PdfConversionJobState.COMPLETED, "Complete", null,
+            book.id, System.currentTimeMillis()) > 0) { "This conversion was stopped before import." }
+        return true
+    }
+
+    @Transaction
+    suspend fun completePdfConversionJobWithExistingBook(jobId: String, token: String, bookId: String): Boolean {
+        val job = pdfConversionJobById(jobId) ?: return false
+        if (job.runnerToken != token || job.status != PdfConversionJobState.RUNNING) return false
+        if (bookById(bookId) == null) return false
+        return finishPdfConversionJob(jobId, token, PdfConversionJobState.COMPLETED, "Complete", null,
+            bookId, System.currentTimeMillis()) > 0
+    }
+
+    @Query("UPDATE pdf_conversion_jobs SET status = CASE status WHEN 'PAUSE_REQUESTED' THEN 'PAUSED' WHEN 'CANCEL_REQUESTED' THEN 'CANCELLED' ELSE 'INTERRUPTED' END, stage = CASE status WHEN 'PAUSE_REQUESTED' THEN 'Paused' WHEN 'CANCEL_REQUESTED' THEN 'Cancelled' ELSE 'Interrupted' END, runnerToken = NULL, runnerType = NULL, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status IN ('PAUSE_REQUESTED', 'CANCEL_REQUESTED')")
+    suspend fun settlePdfConversionJobRequest(id: String, token: String, now: Long): Int
+
+    @Query("UPDATE pdf_conversion_jobs SET status = 'INTERRUPTED', stage = 'Interrupted', runnerToken = NULL, runnerType = NULL, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status = 'RUNNING'")
+    suspend fun interruptPdfConversionJob(id: String, token: String, now: Long): Int
+
+    @Query("UPDATE pdf_conversion_jobs SET status = 'QUEUED', stage = 'Queued for automatic recovery', runnerToken = NULL, runnerType = NULL, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status = 'RUNNING' AND autoRun = 1")
+    suspend fun continuePdfConversionAfterWorkerSlice(id: String, token: String, now: Long): Int
+
+    @Transaction
+    suspend fun requestPausePdfConversionJob(id: String, now: Long): PdfConversionJobEntity? {
+        val job = pdfConversionJobById(id) ?: return null
+        val updated = when (job.status) {
+            PdfConversionJobState.QUEUED -> job.copy(status = PdfConversionJobState.PAUSED, stage = "Paused", autoRun = false, updatedAt = now)
+            PdfConversionJobState.RUNNING -> job.copy(status = PdfConversionJobState.PAUSE_REQUESTED, stage = "Pausing", autoRun = false, updatedAt = now)
+            else -> return null
+        }
+        updatePdfConversionJob(updated)
+        return updated
+    }
+
+    @Transaction
+    suspend fun requestCancelPdfConversionJob(id: String, now: Long): PdfConversionJobEntity? {
+        val job = pdfConversionJobById(id) ?: return null
+        val updated = when (job.status) {
+            PdfConversionJobState.QUEUED, PdfConversionJobState.PAUSED, PdfConversionJobState.FAILED,
+            PdfConversionJobState.INTERRUPTED -> job.copy(status = PdfConversionJobState.CANCELLED, stage = "Cancelled",
+                runnerToken = null, runnerType = null, autoRun = false, updatedAt = now)
+            PdfConversionJobState.RUNNING -> job.copy(status = PdfConversionJobState.CANCEL_REQUESTED,
+                stage = "Cancelling", autoRun = false, updatedAt = now)
+            else -> return null
+        }
+        updatePdfConversionJob(updated)
+        return updated
+    }
+
+    @Transaction
+    suspend fun resumePdfConversionJob(id: String, now: Long, retry: Boolean = false): PdfConversionJobEntity? {
+        val job = pdfConversionJobById(id) ?: return null
+        val allowed = if (retry) setOf(PdfConversionJobState.FAILED, PdfConversionJobState.CANCELLED,
+            PdfConversionJobState.INTERRUPTED, PdfConversionJobState.PAUSED, PdfConversionJobState.QUEUED)
+        else setOf(PdfConversionJobState.QUEUED, PdfConversionJobState.PAUSED, PdfConversionJobState.INTERRUPTED,
+            PdfConversionJobState.FAILED)
+        if (job.status !in allowed) return null
+        return job.copy(status = PdfConversionJobState.QUEUED, stage = "Queued", error = null,
+            runnerToken = null, runnerType = null, autoRun = true, updatedAt = now).also { updatePdfConversionJob(it) }
+    }
+
+    @Query("UPDATE pdf_conversion_jobs SET status = 'FAILED', stage = 'Failed', error = :error, runnerToken = NULL, runnerType = NULL, autoRun = 0, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status = 'RUNNING'")
+    suspend fun failPdfConversionJob(id: String, token: String, error: String, now: Long): Int
+
+    @Query("UPDATE pdf_conversion_jobs SET status = CASE status WHEN 'PAUSE_REQUESTED' THEN 'PAUSED' WHEN 'CANCEL_REQUESTED' THEN 'CANCELLED' WHEN 'RUNNING' THEN CASE WHEN autoRun = 1 THEN 'QUEUED' ELSE 'INTERRUPTED' END ELSE 'INTERRUPTED' END, stage = CASE status WHEN 'PAUSE_REQUESTED' THEN 'Paused' WHEN 'CANCEL_REQUESTED' THEN 'Cancelled' WHEN 'RUNNING' THEN CASE WHEN autoRun = 1 THEN 'Queued for automatic recovery' ELSE 'Interrupted' END ELSE 'Interrupted' END, runnerToken = NULL, runnerType = NULL, updatedAt = :now WHERE id = :id AND runnerToken = :token AND status IN ('RUNNING', 'PAUSE_REQUESTED', 'CANCEL_REQUESTED')")
+    suspend fun reconcileOrphanedPdfConversionJob(id: String, token: String, now: Long): Int
+
+    @Query("SELECT * FROM pdf_conversion_jobs WHERE autoRun = 1 AND status IN ('QUEUED', 'INTERRUPTED') ORDER BY createdAt")
+    suspend fun automaticPdfConversionJobs(): List<PdfConversionJobEntity>
+
+    @Query("DELETE FROM pdf_conversion_jobs WHERE id = :id AND runnerToken IS NULL AND status NOT IN ('RUNNING', 'PAUSE_REQUESTED', 'CANCEL_REQUESTED')")
+    suspend fun deletePdfConversionJobIfUnclaimed(id: String): Int
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertRestoreTransaction(transaction: RestoreTransactionEntity): Long
 

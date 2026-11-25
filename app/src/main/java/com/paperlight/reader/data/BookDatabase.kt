@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [BookEntity::class, LibraryEntity::class, WebNovelJobEntity::class, DiscoverySourceEntity::class, RestoreTransactionEntity::class], version = 9, exportSchema = false)
+@Database(entities = [BookEntity::class, LibraryEntity::class, WebNovelJobEntity::class, PdfConversionJobEntity::class, DiscoverySourceEntity::class, RestoreTransactionEntity::class], version = 10, exportSchema = false)
 abstract class BookDatabase : RoomDatabase() {
     abstract fun bookDao(): BookDao
 
@@ -70,6 +70,15 @@ abstract class BookDatabase : RoomDatabase() {
             }
         }
 
+        internal val addPdfConversionJobs = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS `pdf_conversion_jobs` (`id` TEXT NOT NULL, `sourceName` TEXT NOT NULL, `sourceSize` INTEGER NOT NULL, `inputHash` TEXT NOT NULL, `inputSnapshotPath` TEXT NOT NULL, `mode` TEXT NOT NULL, `optionsJson` TEXT NOT NULL, `libraryId` TEXT NOT NULL, `status` TEXT NOT NULL, `completedPages` INTEGER NOT NULL, `totalPages` INTEGER NOT NULL, `stage` TEXT NOT NULL, `error` TEXT, `warning` TEXT, `runnerToken` TEXT, `runnerType` TEXT, `checkpointKey` TEXT NOT NULL, `resultBookId` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `autoRun` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_pdf_conversion_jobs_createdAt` ON `pdf_conversion_jobs` (`createdAt`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_pdf_conversion_jobs_status` ON `pdf_conversion_jobs` (`status`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_pdf_conversion_jobs_checkpointKey` ON `pdf_conversion_jobs` (`checkpointKey`)")
+            }
+        }
+
         private fun createDiscoverySources(db: SupportSQLiteDatabase) {
             db.execSQL("CREATE TABLE IF NOT EXISTS `discovery_sources` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, `baseUrl` TEXT NOT NULL, `enabled` INTEGER NOT NULL, `configJson` TEXT NOT NULL, `cacheKey` TEXT, `cacheJson` TEXT, `cacheUpdatedAt` INTEGER, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))")
         }
@@ -105,7 +114,7 @@ abstract class BookDatabase : RoomDatabase() {
                     context.applicationContext,
                     BookDatabase::class.java,
                     "paperlight-library.db"
-                ).addMigrations(addChapterPage, resetChapterCounts, addLibraries, addWebNovelJobs, addWebNovelJobTitle, addDiscoverySources, addBackupRecoveryAndAutomaticJobs, removeGutenbergAndSeedNovelPing)
+                ).addMigrations(addChapterPage, resetChapterCounts, addLibraries, addWebNovelJobs, addWebNovelJobTitle, addDiscoverySources, addBackupRecoveryAndAutomaticJobs, removeGutenbergAndSeedNovelPing, addPdfConversionJobs)
                     .addCallback(object : RoomDatabase.Callback() {
                         override fun onCreate(db: SupportSQLiteDatabase) {
                             seedDiscoverySources(db)

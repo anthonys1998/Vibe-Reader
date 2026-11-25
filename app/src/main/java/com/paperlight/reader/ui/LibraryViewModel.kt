@@ -10,7 +10,9 @@ import com.paperlight.reader.data.BookRepository
 import com.paperlight.reader.data.DiscoverySourceEntity
 import com.paperlight.reader.data.BackupProgress
 import com.paperlight.reader.data.BackupProgressStage
+import com.paperlight.reader.data.pdf.PdfConversionRecoveryWorker
 import com.paperlight.reader.data.PdfEpubMode
+import com.paperlight.reader.data.PdfConversionJobEntity
 import com.paperlight.reader.data.WebNovelJobEntity
 import com.paperlight.reader.data.WebNovelJobState
 import java.io.File
@@ -37,6 +39,9 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
         emptyList()
     )
     val webNovelJobs = repository.webNovelJobs.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
+    )
+    val pdfConversionJobs = repository.pdfConversionJobs.stateIn(
         viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
     )
     val discoverySources = repository.discoverySources.stateIn(
@@ -68,6 +73,8 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
                 repository.ensureDefaultLibrary()
                 repository.reconcileWebNovelJobs(WebNovelExportService.isServiceActive())
                 WebNovelRecoveryWorker.scheduleAutomaticJobs(context, repository)
+                repository.reconcilePdfConversionJobs()
+                PdfConversionRecoveryWorker.scheduleAutomaticJobs(context.applicationContext, repository)
                 repository.refreshMetadata()
                 _backupRecoveryBlocked.value = false
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -453,29 +460,75 @@ class LibraryViewModel(private val repository: BookRepository, private val conte
         job.status in setOf(WebNovelJobState.QUEUED, WebNovelJobState.PAUSED, WebNovelJobState.INTERRUPTED, WebNovelJobState.FAILED) ||
             job.status == WebNovelJobState.WAITING_RATE_LIMIT
 
-    private var conversionJob: kotlinx.coroutines.Job? = null
-    private val _conversionProgress = MutableStateFlow<Pair<Int, Int>?>(null)
-    val conversionProgress = _conversionProgress.asStateFlow()
-
-    fun cancelConversion() { conversionJob?.cancel() }
-
-    fun convertPdf(source: File, fallbackTitle: String, mode: PdfEpubMode, libraryId: String) {
+    fun enqueuePdfConversion(source: Uri, displayName: String, mode: PdfEpubMode, libraryId: String) {
         if (!recoveryAllowsLibraryAction()) return
-        if (conversionJob?.isActive == true) return
-        _conversionProgress.value = 0 to 0
-        conversionJob = viewModelScope.launch {
+        viewModelScope.launch {
             try {
-                repository.convertPdfToEpub(source, fallbackTitle, mode, libraryId) { completed, total ->
-                    _conversionProgress.value = completed to total
-                }.fold(
-                    onSuccess = { _message.value = "Created ${it.title}.epub" },
-                    onFailure = { _message.value = it.message ?: "Could not convert this PDF." },
+                val job = repository.enqueuePdfConversion(
+                    sourceUri = source,
+                    displayName = displayName,
+                    libraryId = libraryId,
+                    mode = mode,
                 )
+                _message.value = "Queued ${job.sourceName} for PDF conversion."
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                _message.value = "Conversion cancelled."
                 throw cancelled
-            } finally {
-                _conversionProgress.value = null
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not queue this PDF conversion."
+            }
+        }
+    }
+
+    fun enqueueLibraryPdfConversion(bookId: String, mode: PdfEpubMode) {
+        if (!recoveryAllowsLibraryAction()) return
+        viewModelScope.launch {
+            try {
+                val job = repository.enqueueLibraryPdfConversion(bookId, mode)
+                _message.value = "Queued ${job.sourceName} for PDF conversion."
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not queue this PDF conversion."
+            }
+        }
+    }
+
+    fun resumePdfConversionJob(id: String) = runPdfConversionJobAction("Could not resume this PDF conversion.") {
+        repository.resumePdfConversionJob(id)
+    }
+
+    fun retryPdfConversionJob(id: String) = runPdfConversionJobAction("Could not retry this PDF conversion.") {
+        repository.retryPdfConversionJob(id)
+    }
+
+    fun pausePdfConversionJob(id: String) = runPdfConversionJobAction("Could not pause this PDF conversion.") {
+        repository.pausePdfConversionJob(id)
+    }
+
+    fun cancelPdfConversionJob(id: String) = runPdfConversionJobAction("Could not cancel this PDF conversion.") {
+        repository.cancelPdfConversionJob(id)
+    }
+
+    fun removePdfConversionJob(id: String) {
+        viewModelScope.launch {
+            try {
+                if (!repository.removePdfConversionJob(id)) _message.value = "This PDF conversion was already removed."
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: "Could not remove this PDF conversion."
+            }
+        }
+    }
+
+    private fun runPdfConversionJobAction(errorMessage: String, action: suspend () -> PdfConversionJobEntity?) {
+        viewModelScope.launch {
+            try {
+                if (action() == null) _message.value = "This PDF conversion no longer exists."
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                _message.value = failure.message ?: errorMessage
             }
         }
     }

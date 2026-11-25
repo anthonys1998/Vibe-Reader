@@ -356,7 +356,8 @@ class WebNovelJobPersistenceTest {
 
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
             .addMigrations(BookDatabase.addWebNovelJobs, BookDatabase.addWebNovelJobTitle, BookDatabase.addDiscoverySources,
-                BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing).build()
+                BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing,
+                BookDatabase.addPdfConversionJobs).build()
         try {
             runBlocking {
                 assertEquals("Existing", migrated.bookDao().bookById("existing")?.title)
@@ -389,7 +390,8 @@ class WebNovelJobPersistenceTest {
 
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
             .addMigrations(BookDatabase.addWebNovelJobTitle, BookDatabase.addDiscoverySources,
-                BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing).build()
+                BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing,
+                BookDatabase.addPdfConversionJobs).build()
         try {
             val legacy = requireNotNull(migrated.bookDao().webNovelJobById("legacy-job"))
             assertEquals(WebNovelJobState.PAUSED, legacy.status)
@@ -419,7 +421,7 @@ class WebNovelJobPersistenceTest {
         old.close()
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
             .addMigrations(BookDatabase.addDiscoverySources, BookDatabase.addBackupRecoveryAndAutomaticJobs,
-                BookDatabase.removeGutenbergAndSeedNovelPing).build()
+                BookDatabase.removeGutenbergAndSeedNovelPing, BookDatabase.addPdfConversionJobs).build()
         try {
             assertEquals("Saved", migrated.bookDao().bookById("saved-book")?.title)
             assertEquals(WebNovelJobState.PAUSED, migrated.bookDao().webNovelJobById("saved-job")?.status)
@@ -462,7 +464,8 @@ class WebNovelJobPersistenceTest {
         old.close()
 
         val migrated = Room.databaseBuilder(context, BookDatabase::class.java, name)
-            .addMigrations(BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing).build()
+            .addMigrations(BookDatabase.addBackupRecoveryAndAutomaticJobs, BookDatabase.removeGutenbergAndSeedNovelPing,
+                BookDatabase.addPdfConversionJobs).build()
         try {
             val dao = migrated.bookDao()
             assertTrue(requireNotNull(dao.webNovelJobById("queued")).autoRun)

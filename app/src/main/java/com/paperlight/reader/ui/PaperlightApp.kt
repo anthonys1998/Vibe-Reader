@@ -86,6 +86,7 @@ import com.paperlight.reader.data.BookEntity
 import com.paperlight.reader.data.BookRepository
 import com.paperlight.reader.data.DiscoverySourceEntity
 import com.paperlight.reader.data.PdfEpubMode
+import com.paperlight.reader.data.PdfConversionJobState
 import com.paperlight.reader.data.WebNovelJobState
 import com.paperlight.reader.discovery.DiscoverySourceConfigCodec
 import com.paperlight.reader.ui.reader.EpubReaderScreen
@@ -165,8 +166,8 @@ private fun PaperlightAppContent(
     val libraries by viewModel.libraries.collectAsState()
     val downloadProgress by viewModel.downloadProgress.collectAsState()
     val webNovelJobs by viewModel.webNovelJobs.collectAsState()
+    val pdfConversionJobs by viewModel.pdfConversionJobs.collectAsState()
     val discoverySources by viewModel.discoverySources.collectAsState()
-    val conversionProgress by viewModel.conversionProgress.collectAsState()
     val message by viewModel.message.collectAsState()
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
@@ -221,8 +222,11 @@ private fun PaperlightAppContent(
     var showDeleteBooks by remember { mutableStateOf(false) }
     var showCreateFromWeb by remember { mutableStateOf(false) }
     var showWebNovelJobs by rememberSaveable { mutableStateOf(false) }
+    var showPdfConversionJobs by rememberSaveable { mutableStateOf(false) }
     var showBookDiscovery by rememberSaveable { mutableStateOf(false) }
-    var pendingPdfPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingPdfUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingPdfBookId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingPdfDisplayName by rememberSaveable { mutableStateOf("") }
     var pendingPdfTitle by rememberSaveable { mutableStateOf("") }
     var pdfConversionMode by rememberSaveable { mutableStateOf(PdfEpubMode.Text) }
     var novelUrl by remember { mutableStateOf("") }
@@ -352,9 +356,19 @@ private fun PaperlightAppContent(
         }
     }
 
-    fun choosePdf(path: String, title: String) {
-        pendingPdfPath = path
-        pendingPdfTitle = title
+    fun choosePdf(sourceUri: String, displayName: String) {
+        pendingPdfUri = sourceUri
+        pendingPdfBookId = null
+        pendingPdfDisplayName = displayName
+        pendingPdfTitle = displayName.substringBeforeLast('.', displayName)
+        pdfConversionMode = PdfEpubMode.Text
+    }
+
+    fun chooseLibraryPdf(book: BookEntity) {
+        pendingPdfUri = null
+        pendingPdfBookId = book.id
+        pendingPdfDisplayName = book.fileName
+        pendingPdfTitle = book.title
         pdfConversionMode = PdfEpubMode.Text
     }
 
@@ -515,18 +529,19 @@ private fun PaperlightAppContent(
     BackHandler(showBookDiscovery && !showCreateFromWeb && !showGroqApiKeyScreen) { showBookDiscovery = false }
     BackHandler(pagerState.currentPage == 1 || fileManagerMode != FileManagerMode.Browse) { returnToLibrary() }
     BackHandler(showWebNovelJobs) { showWebNovelJobs = false }
+    BackHandler(showPdfConversionJobs) { showPdfConversionJobs = false }
     Box(Modifier.fillMaxSize()) {
     HorizontalPager(
         state = pagerState,
-        userScrollEnabled = !showBookDiscovery && !showWebNovelJobs && !drawer.isOpen && fileManagerMode == FileManagerMode.Browse,
+        userScrollEnabled = !showBookDiscovery && !showWebNovelJobs && !showPdfConversionJobs && !drawer.isOpen && fileManagerMode == FileManagerMode.Browse,
         beyondViewportPageCount = 1,
-        modifier = Modifier.fillMaxSize().pointerInput(drawer.isOpen, pagerState, fileManagerMode, showWebNovelJobs, showBookDiscovery) {
+        modifier = Modifier.fillMaxSize().pointerInput(drawer.isOpen, pagerState, fileManagerMode, showWebNovelJobs, showPdfConversionJobs, showBookDiscovery) {
             val touchSlop = viewConfiguration.touchSlop
             val menuSwipeDistance = 96.dp.toPx()
             val horizontalRatio = 1.5f
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                if (showBookDiscovery || showWebNovelJobs || drawer.isOpen || fileManagerMode != FileManagerMode.Browse || pagerState.currentPage != 0 ||
+                if (showBookDiscovery || showWebNovelJobs || showPdfConversionJobs || drawer.isOpen || fileManagerMode != FileManagerMode.Browse || pagerState.currentPage != 0 ||
                     pagerState.canScrollBackward || pagerState.isScrollInProgress
                 ) return@awaitEachGesture
 
@@ -567,7 +582,7 @@ private fun PaperlightAppContent(
             onClose = ::returnToLibrary,
             onOpenFile = { file ->
                 if (fileManagerMode == FileManagerMode.ConvertPdf) {
-                    file.uri.path?.let { path -> choosePdf(path, file.name.substringBeforeLast('.')) }
+                    choosePdf(file.uri.toString(), file.name)
                     returnToLibrary()
                 } else openExternalBook(file)
             },
@@ -585,6 +600,22 @@ private fun PaperlightAppContent(
             jobs = webNovelJobs,
             viewModel = viewModel,
             onBack = { showWebNovelJobs = false },
+        )
+      } else if (showPdfConversionJobs) {
+        PdfConversionJobsScreen(
+            jobs = pdfConversionJobs,
+            viewModel = viewModel,
+            onBack = { showPdfConversionJobs = false },
+            onOpenBook = { resultBookId ->
+                val resultBook = books.firstOrNull { it.id == resultBookId }
+                if (resultBook == null) {
+                    scope.launch { snackbar.showSnackbar("The converted EPUB is no longer in your library.") }
+                } else {
+                    showPdfConversionJobs = false
+                    activeLibraryId = resultBook.libraryId
+                    selectedId = resultBookId
+                }
+            },
         )
       } else {
        ModalNavigationDrawer(
@@ -632,9 +663,14 @@ private fun PaperlightAppContent(
                     icon = { Icon(Icons.Rounded.Link, null) }, badge = { Text("${webNovelJobs.count { it.status !in setOf(WebNovelJobState.COMPLETED, WebNovelJobState.CANCELLED) }}") },
                     onClick = { showWebNovelJobs = true; scope.launch { drawer.close() } },
                     modifier = Modifier.padding(horizontal = 12.dp))
+                NavigationDrawerItem(label = { Text("PDF conversions") }, selected = false,
+                    icon = { Icon(Icons.Rounded.PictureAsPdf, null) },
+                    badge = { Text("${pdfConversionJobs.count { it.status !in setOf(PdfConversionJobState.COMPLETED, PdfConversionJobState.CANCELLED) }}") },
+                    onClick = { showPdfConversionJobs = true; scope.launch { drawer.close() } },
+                    modifier = Modifier.padding(horizontal = 12.dp))
                 NavigationDrawerItem(label = { Text("Convert PDF to EPUB") }, selected = false,
                     icon = { Icon(Icons.Rounded.PictureAsPdf, null) },
-                    onClick = { if (conversionProgress == null) showFileManager(FileManagerMode.ConvertPdf) },
+                    onClick = { showFileManager(FileManagerMode.ConvertPdf) },
                     modifier = Modifier.padding(horizontal = 12.dp))
                 NavigationDrawerItem(label = { Text("Discover") }, selected = showBookDiscovery,
                     icon = { Icon(Icons.Rounded.Search, null) },
@@ -677,8 +713,7 @@ private fun PaperlightAppContent(
                             books.find { it.id == id && it.format == "PDF" }
                         }
                         if (selectedPdf != null) {
-                            IconButton(enabled = conversionProgress == null,
-                                onClick = { choosePdf(selectedPdf.localPath, selectedPdf.title) }) {
+                            IconButton(onClick = { chooseLibraryPdf(selectedPdf) }) {
                                 Icon(Icons.Rounded.PictureAsPdf, "Convert PDF to EPUB")
                             }
                         }
@@ -832,19 +867,6 @@ private fun PaperlightAppContent(
                     ) else LinearProgressIndicator(Modifier.fillMaxWidth())
                 }
             } else if (libraryBusy || folder != null) LinearProgressIndicator(Modifier.fillMaxWidth())
-            conversionProgress?.let { (completed, total) ->
-                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(if (total > 0) "Converting PDF · $completed / $total pages" else "Opening PDF…",
-                            Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-                        TextButton(onClick = viewModel::cancelConversion) { Text("Cancel") }
-                    }
-                    if (total > 0) LinearProgressIndicator(
-                        progress = { (completed.toFloat() / total).coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) else LinearProgressIndicator(Modifier.fillMaxWidth())
-                }
-            }
             downloadProgress?.let { progress ->
                 Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -932,9 +954,9 @@ private fun PaperlightAppContent(
     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding())
     }
 
-    if (pagerState.settledPage == 0) pendingPdfPath?.let { path ->
+    if (pagerState.settledPage == 0 && (pendingPdfUri != null || pendingPdfBookId != null)) {
         AlertDialog(
-            onDismissRequest = { pendingPdfPath = null },
+            onDismissRequest = { pendingPdfUri = null; pendingPdfBookId = null },
             title = { Text("Convert PDF to EPUB") },
             text = {
                 Column {
@@ -957,13 +979,19 @@ private fun PaperlightAppContent(
                 }
             },
             confirmButton = {
-                TextButton(enabled = conversionProgress == null, onClick = {
-                    viewModel.convertPdf(File(path), pendingPdfTitle, pdfConversionMode, activeLibraryId ?: "default")
-                    pendingPdfPath = null
+                TextButton(onClick = {
+                    val bookId = pendingPdfBookId
+                    if (bookId != null) viewModel.enqueueLibraryPdfConversion(bookId, pdfConversionMode)
+                    else pendingPdfUri?.let { sourceUri ->
+                        viewModel.enqueuePdfConversion(Uri.parse(sourceUri), pendingPdfDisplayName, pdfConversionMode, activeLibraryId ?: "default")
+                    }
+                    pendingPdfUri = null
+                    pendingPdfBookId = null
                     selectedBooks = emptySet()
+                    showPdfConversionJobs = true
                 }) { Text("Convert and add") }
             },
-            dismissButton = { TextButton(onClick = { pendingPdfPath = null }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { pendingPdfUri = null; pendingPdfBookId = null }) { Text("Cancel") } },
         )
     }
     if (showStatistics) ReadingStatisticsDialog(books) { showStatistics = false }

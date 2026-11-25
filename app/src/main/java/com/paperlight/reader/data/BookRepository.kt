@@ -7,7 +7,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.MessageDigest
 import java.util.UUID
+import java.util.zip.ZipFile
+import androidx.core.content.ContextCompat
+import com.paperlight.reader.data.pdf.PdfConversionRecoveryWorker
+import com.paperlight.reader.data.pdf.PdfConversionService
 import com.paperlight.reader.webnovel.WebNovelEpubUtility
 import com.paperlight.reader.webnovel.WebNovelChapterManifestCodec
 import com.paperlight.reader.webnovel.WebNovelChapterManifestStore
@@ -34,6 +39,9 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
     companion object {
         const val MAX_DISCOVERY_CACHE_BYTES = 256 * 1024
         private const val WORKER_SLICE_RETRY_MILLIS = 15 * 1_000L
+        private const val MAX_PDF_INPUT_BYTES = 256L * 1024L * 1024L
+        private const val MAX_PDF_SNAPSHOT_BYTES = 1024L * 1024L * 1024L
+        private const val MAX_PDF_JOBS = 20
 
         fun formatOf(name: String): String? = when (val extension = name.substringAfterLast('.', "").uppercase(java.util.Locale.ROOT)) {
             "EPUB", "PDF", "MOBI", "AZW3", "TXT", "CBZ", "CBR" -> extension
@@ -48,6 +56,7 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
     val books: Flow<List<BookEntity>> = dao.observeBooks()
     val libraries: Flow<List<LibraryEntity>> = dao.observeLibraries()
     val webNovelJobs: Flow<List<WebNovelJobEntity>> = dao.observeWebNovelJobs()
+    val pdfConversionJobs: Flow<List<PdfConversionJobEntity>> = dao.observePdfConversionJobs()
     val discoverySources: Flow<List<DiscoverySourceEntity>> = dao.observeDiscoverySources()
 
     private suspend fun <T> withLibraryOperation(allowPendingRestore: Boolean = false, operation: suspend () -> T): T {
@@ -118,11 +127,13 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
         libraryId: String = "default",
         stableId: String? = null,
         webNovelJob: Pair<String, String>? = null,
+        pdfConversionJob: Pair<String, String>? = null,
     ): Result<BookEntity> =
         withContext(Dispatchers.IO) {
             runCatching {
                 withLibraryOperation {
                     require(file.isFile && file.length() > 0L) { "EPUB generation produced an empty file." }
+                    require(webNovelJob == null || pdfConversionJob == null) { "A generated book cannot belong to two conversion jobs." }
                     ensureDefaultLibraryUnlocked()
                     require(dao.findLibrary(libraryId) != null) { "That library no longer exists." }
                     val id = stableId ?: UUID.randomUUID().toString()
@@ -133,9 +144,22 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
                             "This conversion was paused, cancelled, or interrupted before import."
                         }
                     }
+                    pdfConversionJob?.let { (jobId, token) ->
+                        val job = requireNotNull(dao.pdfConversionJobById(jobId)) { "This PDF conversion job no longer exists." }
+                        require(job.runnerToken == token && job.status == PdfConversionJobState.RUNNING) {
+                            "This conversion was paused, cancelled, or interrupted before import."
+                        }
+                        require(job.resultBookId == id) { "This PDF conversion produced the wrong book identifier." }
+                    }
                     suspend fun markConversionCompleted(bookId: String) {
                         webNovelJob?.let { (jobId, token) ->
                             check(dao.completeWebNovelJobWithExistingBook(jobId, token, bookId)) {
+                                "This conversion was paused, cancelled, or interrupted before import."
+                            }
+                            BookRepositoryOperationLock.release(token)
+                        }
+                        pdfConversionJob?.let { (jobId, token) ->
+                            check(dao.completePdfConversionJobWithExistingBook(jobId, token, bookId)) {
                                 "This conversion was paused, cancelled, or interrupted before import."
                             }
                             BookRepositoryOperationLock.release(token)
@@ -169,12 +193,18 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
                                 java.nio.file.Files.move(incoming.toPath(), destination.toPath(),
                                     java.nio.file.StandardCopyOption.REPLACE_EXISTING)
                             }
-                            if (webNovelJob == null) dao.insertBook(generatedBook)
-                            else {
+                            if (webNovelJob == null && pdfConversionJob == null) dao.insertBook(generatedBook)
+                            else if (webNovelJob != null) {
                                 check(dao.insertGeneratedWebNovelBookAndFinish(generatedBook, webNovelJob.first, webNovelJob.second)) {
                                     "This conversion was paused, cancelled, or interrupted before import."
                                 }
                                 BookRepositoryOperationLock.release(webNovelJob.second)
+                            }
+                            pdfConversionJob?.let { (jobId, token) ->
+                                check(dao.insertGeneratedPdfBookAndFinish(generatedBook, jobId, token)) {
+                                    "This conversion was paused, cancelled, or interrupted before import."
+                                }
+                                BookRepositoryOperationLock.release(token)
                             }
                             file.delete()
                         }
@@ -207,6 +237,485 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
             Result.failure(failure)
         } finally {
             destination.delete()
+        }
+    }
+
+    suspend fun importPdfConversionEpub(
+        file: File,
+        title: String,
+        author: String,
+        jobId: String,
+        token: String,
+        inputHash: String,
+        fallbackPageNumbers: List<Int>,
+    ): Result<BookEntity> {
+        return try {
+            validateGeneratedPdfEpub(file)
+            val job = requireNotNull(dao.pdfConversionJobById(jobId)) { "This PDF conversion job no longer exists." }
+            require(job.inputHash == inputHash) { "The PDF conversion input changed while it was running." }
+            val warning = fallbackPageNumbers.distinct().sorted().takeIf {
+                it.isNotEmpty() && job.mode != PdfEpubMode.Images.name
+            }?.let { pages ->
+                val shown = pages.take(20).joinToString(", ")
+                "Pages kept as images because text order was uncertain: $shown${if (pages.size > 20) ", and ${pages.size - 20} more" else ""}."
+            }
+            require(updatePdfConversionJobWarning(jobId, token, warning)) { "This conversion was stopped before import." }
+            importGeneratedEpub(file, title, author, job.libraryId, stableId = job.resultBookId,
+                pdfConversionJob = jobId to token)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Result.failure(failure)
+        }
+    }
+
+    private fun validateGeneratedPdfEpub(file: File) {
+        require(file.isFile && file.length() in 1L..(512L * 1024L * 1024L)) {
+            "The generated EPUB is empty or exceeds the 512 MiB output limit."
+        }
+        ZipFile(file).use { zip ->
+            val entries = zip.entries().asSequence().toList()
+            require(entries.isNotEmpty() && entries.size <= 50_000) { "The generated EPUB has an invalid entry count." }
+            require(entries.none { it.name.startsWith('/') || it.name.split('/').any { part -> part == ".." } }) {
+                "The generated EPUB contains an unsafe file path."
+            }
+            val mimeEntry = requireNotNull(zip.getEntry("mimetype")) { "The generated EPUB has no MIME declaration." }
+            val mime = zip.getInputStream(mimeEntry).bufferedReader(Charsets.US_ASCII).use { it.readText() }
+            require(mime == "application/epub+zip") { "The generated file is not an EPUB." }
+            val containerEntry = requireNotNull(zip.getEntry("META-INF/container.xml")) {
+                "The generated EPUB has no package container."
+            }
+            val container = zip.getInputStream(containerEntry).bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val packagePath = Regex("""full-path\s*=\s*[\"']([^\"']+)[\"']""").find(container)?.groupValues?.get(1)
+                ?: error("The generated EPUB package path is missing.")
+            require(zip.getEntry(packagePath) != null) { "The generated EPUB package file is missing." }
+            require(entries.any { it.name.endsWith(".xhtml", true) || it.name.endsWith(".html", true) }) {
+                "The generated EPUB contains no readable content."
+            }
+        }
+    }
+
+    suspend fun enqueuePdfConversion(
+        sourceUri: Uri,
+        displayName: String? = null,
+        libraryId: String = "default",
+        mode: PdfEpubMode = PdfEpubMode.Text,
+    ): PdfConversionJobEntity = withContext(Dispatchers.IO) {
+        val job = withLibraryOperation {
+            ensureDefaultLibraryUnlocked()
+            require(dao.findLibrary(libraryId) != null) { "That library no longer exists." }
+            val name = displayName?.takeIf { it.isNotBlank() } ?: displayNameForPdfUri(sourceUri)
+            val extension = name.substringAfterLast('.', "")
+            require(extension.isBlank() || extension.equals("pdf", ignoreCase = true)) { "Choose a PDF file." }
+            val directory = pdfInputDirectory().apply { mkdirs() }
+            val temporary = File(directory, "${UUID.randomUUID()}.partial")
+            try {
+                val source = if (sourceUri.scheme == "file") File(requireNotNull(sourceUri.path)).inputStream()
+                    else requireNotNull(context.contentResolver.openInputStream(sourceUri)) { "Unable to open the selected PDF." }
+                val snapshot = source.use { copyAndHashPdfInput(it, temporary) }
+                validatePdfSnapshot(temporary, snapshot.first)
+                enqueuePdfSnapshotUnlocked(temporary, name, snapshot.first, snapshot.second, libraryId, mode)
+            } catch (failure: Exception) {
+                temporary.delete()
+                throw failure
+            }
+        }
+        activatePdfJob(job)
+        job
+    }
+
+    suspend fun enqueueLibraryPdfConversion(
+        bookId: String,
+        mode: PdfEpubMode = PdfEpubMode.Text,
+    ): PdfConversionJobEntity = withContext(Dispatchers.IO) {
+        val job = withLibraryOperation {
+            val book = requireNotNull(dao.bookById(bookId)) { "That book no longer exists." }
+            require(book.format == "PDF") { "Choose a PDF book." }
+            require(dao.findLibrary(book.libraryId) != null) { "That library no longer exists." }
+            val source = File(book.localPath)
+            require(source.isFile) { "The saved PDF file is missing." }
+            val directory = pdfInputDirectory().apply { mkdirs() }
+            val temporary = File(directory, "${UUID.randomUUID()}.partial")
+            try {
+                val snapshot = source.inputStream().use { copyAndHashPdfInput(it, temporary) }
+                validatePdfSnapshot(temporary, snapshot.first)
+                enqueuePdfSnapshotUnlocked(temporary, book.fileName.ifBlank { source.name }, snapshot.first,
+                    snapshot.second, book.libraryId, mode)
+            } catch (failure: Exception) {
+                temporary.delete()
+                throw failure
+            }
+        }
+        activatePdfJob(job)
+        job
+    }
+
+    private suspend fun enqueuePdfSnapshotUnlocked(
+        temporary: File,
+        sourceName: String,
+        size: Long,
+        hash: String,
+        libraryId: String,
+        mode: PdfEpubMode,
+    ): PdfConversionJobEntity {
+        val optionsJson = "{}"
+        dao.matchingPdfConversionJob(hash, mode.name, optionsJson, libraryId)?.let { existing ->
+            if (existing.status != PdfConversionJobState.COMPLETED || dao.bookById(existing.resultBookId) != null) {
+                temporary.delete()
+                return existing
+            }
+        }
+        val jobs = dao.allPdfConversionJobs()
+        require(jobs.size < MAX_PDF_JOBS) { "Remove an older PDF job before adding another." }
+        require(jobs.sumOf { it.sourceSize } + size <= MAX_PDF_SNAPSHOT_BYTES) {
+            "PDF job snapshots are using too much storage. Remove old jobs to free space."
+        }
+        require(temporary.usableSpace >= 32L * 1024L * 1024L) { "There is not enough free storage to process this PDF." }
+        val id = UUID.randomUUID().toString()
+        val directory = pdfInputDirectory().apply { mkdirs() }
+        val snapshotFile = File(directory, "$id.pdf")
+        moveAtomically(temporary, snapshotFile)
+        val now = System.currentTimeMillis()
+        val resultBookId = pdfConversionBookId(id)
+        val existingBook = dao.bookById(resultBookId)
+        val job = PdfConversionJobEntity(
+            id = id,
+            sourceName = sourceName.take(512),
+            sourceSize = size,
+            inputHash = hash,
+            inputSnapshotPath = snapshotFile.absolutePath,
+            mode = mode.name,
+            optionsJson = optionsJson,
+            libraryId = libraryId,
+            status = if (existingBook == null) PdfConversionJobState.QUEUED else PdfConversionJobState.COMPLETED,
+            completedPages = 0,
+            totalPages = 0,
+            stage = if (existingBook == null) "Queued" else "Already in library",
+            error = null,
+            warning = null,
+            runnerToken = null,
+            runnerType = null,
+            checkpointKey = pdfCheckpointKey(id),
+            resultBookId = resultBookId,
+            createdAt = now,
+            updatedAt = now,
+            autoRun = existingBook == null,
+        )
+        try {
+            dao.insertPdfConversionJob(job)
+        } catch (failure: Exception) {
+            snapshotFile.delete()
+            throw failure
+        }
+        return job
+    }
+
+    private fun activatePdfJob(job: PdfConversionJobEntity) {
+        if (!job.autoRun || job.status != PdfConversionJobState.QUEUED) return
+        PdfConversionRecoveryWorker.schedule(context, job)
+        runCatching {
+            ContextCompat.startForegroundService(
+                context,
+                android.content.Intent(context, PdfConversionService::class.java)
+                    .putExtra(PdfConversionService.EXTRA_JOB_ID, job.id),
+            )
+        }
+    }
+
+    private fun pdfInputDirectory() = File(context.filesDir, "pdf-conversion-inputs")
+
+    private fun displayNameForPdfUri(uri: Uri): String = if (uri.scheme == "file") {
+        File(requireNotNull(uri.path)).name
+    } else {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && index >= 0) cursor.getString(index) else null
+        } ?: "Selected PDF"
+    }
+
+    private fun copyAndHashPdfInput(input: java.io.InputStream, destination: File): Pair<Long, String> {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val header = ByteArray(1024)
+        var headerLength = 0
+        var total = 0L
+        input.buffered().use { buffered ->
+            destination.outputStream().buffered().use { output ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val count = buffered.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    require(total <= MAX_PDF_INPUT_BYTES) { "PDF files must be 256 MiB or smaller." }
+                    if (headerLength < header.size) {
+                        val copy = minOf(count, header.size - headerLength)
+                        buffer.copyInto(header, headerLength, 0, copy)
+                        headerLength += copy
+                    }
+                    digest.update(buffer, 0, count)
+                    output.write(buffer, 0, count)
+                }
+                output.flush()
+            }
+        }
+        require(total > 0L) { "The selected PDF is empty." }
+        return total to digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+    }
+
+    private fun validatePdfSnapshot(file: File, size: Long) {
+        require(size <= MAX_PDF_INPUT_BYTES && file.isFile && file.length() == size) { "The PDF snapshot is incomplete." }
+        val header = ByteArray(1024)
+        val headerLength = file.inputStream().use { input ->
+            var read = 0
+            while (read < header.size) {
+                val count = input.read(header, read, header.size - read)
+                if (count < 0) break
+                read += count
+            }
+            read
+        }
+        require(String(header, 0, headerLength, Charsets.ISO_8859_1).contains("%PDF-")) {
+            "The selected file is not a valid PDF."
+        }
+    }
+
+    private fun moveAtomically(source: File, destination: File) {
+        try {
+            java.nio.file.Files.move(source.toPath(), destination.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+        } catch (_: Exception) {
+            java.nio.file.Files.move(source.toPath(), destination.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    private fun pdfConversionBookId(jobId: String): String = "pdf-$jobId"
+
+    private fun pdfCheckpointKey(jobId: String): String =
+        MessageDigest.getInstance("SHA-256").digest("pdf-job\n$jobId".toByteArray(Charsets.UTF_8))
+            .joinToString("") { byte -> "%02x".format(byte) }
+
+    suspend fun pdfConversionJobById(id: String): PdfConversionJobEntity? = withContext(Dispatchers.IO) {
+        dao.pdfConversionJobById(id)
+    }
+
+    suspend fun pausePdfConversionJob(id: String, signalService: Boolean = true): PdfConversionJobEntity? = withContext(Dispatchers.IO) {
+        val job = withLibraryOperation { dao.requestPausePdfConversionJob(id, System.currentTimeMillis()) }
+        if (job != null) {
+            PdfConversionRecoveryWorker.cancel(context, id)
+            if (signalService) PdfConversionService.signal(context, id, pause = true)
+        }
+        job
+    }
+
+    suspend fun cancelPdfConversionJob(id: String, signalService: Boolean = true): PdfConversionJobEntity? = withContext(Dispatchers.IO) {
+        val job = withLibraryOperation { dao.requestCancelPdfConversionJob(id, System.currentTimeMillis()) }
+        if (job != null) {
+            PdfConversionRecoveryWorker.cancel(context, id)
+            if (signalService) PdfConversionService.signal(context, id, pause = false)
+        }
+        job
+    }
+
+    suspend fun resumePdfConversionJob(id: String): PdfConversionJobEntity? = requeuePdfConversionJob(id, retry = false)
+
+    suspend fun retryPdfConversionJob(id: String): PdfConversionJobEntity? = requeuePdfConversionJob(id, retry = true)
+
+    private suspend fun requeuePdfConversionJob(id: String, retry: Boolean): PdfConversionJobEntity? =
+        withContext(Dispatchers.IO) {
+            val job = withLibraryOperation {
+                val existing = dao.pdfConversionJobById(id) ?: return@withLibraryOperation null
+                check(dao.findLibrary(existing.libraryId) != null) { "The saved destination library no longer exists." }
+                val snapshot = checkedPdfSnapshot(existing)
+                validatePdfSnapshot(snapshot, existing.sourceSize)
+                check(sha256(snapshot) == existing.inputHash) { "The saved PDF snapshot failed its integrity check." }
+                dao.resumePdfConversionJob(id, System.currentTimeMillis(), retry)
+            }
+            job?.let { activatePdfJob(it) }
+            job
+        }
+
+    suspend fun removePdfConversionJob(id: String): Boolean = withContext(Dispatchers.IO) {
+        val removed = withLibraryOperation {
+            val job = dao.pdfConversionJobById(id) ?: return@withLibraryOperation null
+            if (job.runnerToken != null || job.status in setOf(PdfConversionJobState.RUNNING,
+                    PdfConversionJobState.PAUSE_REQUESTED, PdfConversionJobState.CANCEL_REQUESTED)) return@withLibraryOperation null
+            if (dao.deletePdfConversionJobIfUnclaimed(id) == 0) return@withLibraryOperation null
+            job
+        } ?: return@withContext false
+        PdfConversionRecoveryWorker.cancel(context, id)
+        pdfSnapshotFile(removed).delete()
+        pdfConversionCheckpointDirectory(removed).deleteRecursively()
+        pdfConversionTempOutput(removed).delete()
+        true
+    }
+
+    private fun checkedPdfSnapshot(job: PdfConversionJobEntity): File {
+        val snapshot = pdfSnapshotFile(job)
+        require(snapshot.isFile) { "The saved PDF snapshot is missing." }
+        return snapshot
+    }
+
+    fun pdfConversionInputFile(job: PdfConversionJobEntity): File = checkedPdfSnapshot(job)
+
+    fun pdfConversionTempOutput(job: PdfConversionJobEntity): File {
+        val safeId = job.id.replace(Regex("[^A-Za-z0-9-]"), "_").take(80)
+        return File(context.cacheDir, "pdf-job-$safeId.epub")
+    }
+
+    private fun pdfSnapshotFile(job: PdfConversionJobEntity): File {
+        val expectedParent = pdfInputDirectory().canonicalFile
+        val snapshot = File(job.inputSnapshotPath).canonicalFile
+        require(snapshot.parentFile == expectedParent && snapshot.name == "${job.id}.pdf") {
+            "The saved PDF snapshot path is invalid."
+        }
+        return snapshot
+    }
+
+    fun pdfConversionCheckpointDirectory(job: PdfConversionJobEntity): File {
+        require(job.checkpointKey.matches(Regex("[0-9a-f]{64}"))) { "The saved PDF checkpoint path is invalid." }
+        return File(File(context.filesDir, "pdf-conversion-checkpoints"), job.checkpointKey)
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+    }
+
+    private suspend fun claimPdfConversionRunner(
+        claim: suspend (token: String, now: Long) -> PdfConversionJobEntity?,
+    ): PdfConversionJobEntity? {
+        val token = UUID.randomUUID().toString()
+        return try {
+            withContext(Dispatchers.IO) {
+                withLibraryOperation {
+                    reconcileOrphanedPdfConversionJobsUnlocked()
+                    claim(token, System.currentTimeMillis())?.also { BookRepositoryOperationLock.register(token) }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            runCatching {
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    withLibraryOperation(allowPendingRestore = true) {
+                        try {
+                            dao.allPdfConversionJobs().firstOrNull { it.runnerToken == token }?.let { job ->
+                                dao.reconcileOrphanedPdfConversionJob(job.id, token, System.currentTimeMillis())
+                            }
+                        } finally {
+                            BookRepositoryOperationLock.release(token)
+                        }
+                    }
+                }
+            }
+            throw cancelled
+        }
+    }
+
+    suspend fun claimNextPdfConversionJob(): PdfConversionJobEntity? = claimPdfConversionRunner { token, now ->
+        dao.claimNextPdfConversionJob(token, "FOREGROUND", now)
+    }
+
+    suspend fun claimRedeliveredPdfConversionJob(id: String): PdfConversionJobEntity? = claimPdfConversionRunner { token, now ->
+        dao.claimRedeliveredPdfConversionJob(id, token, now)
+    }
+
+    suspend fun claimAutomaticPdfConversionJob(id: String): PdfConversionJobEntity? = claimPdfConversionRunner { token, now ->
+        dao.claimAutomaticPdfConversionJob(id, token, now)
+    }
+
+    suspend fun automaticPdfConversionJobs(): List<PdfConversionJobEntity> = withContext(Dispatchers.IO) {
+        withLibraryOperation { dao.automaticPdfConversionJobs() }
+    }
+
+    suspend fun updatePdfConversionJobProgress(
+        id: String, token: String, stage: String, completed: Int, total: Int,
+    ): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            dao.updatePdfConversionJobProgress(id, token, stage.take(120), completed.coerceAtLeast(0),
+                total.coerceAtLeast(0), System.currentTimeMillis()) > 0
+        }
+    }
+
+    suspend fun updatePdfConversionJobWarning(id: String, token: String, warning: String?): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            dao.updatePdfConversionJobWarning(id, token, warning?.take(1_000), System.currentTimeMillis()) > 0
+        }
+    }
+
+    suspend fun finishPdfConversionJob(id: String, token: String, resultBookId: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.finishPdfConversionJob(id, token, PdfConversionJobState.COMPLETED, "Complete", null,
+                resultBookId, System.currentTimeMillis()) > 0).also { if (it) BookRepositoryOperationLock.release(token) }
+        }
+    }
+
+    suspend fun failPdfConversionJob(id: String, token: String, error: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.failPdfConversionJob(id, token, error.take(1_000), System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun settlePdfConversionJobRequest(id: String, token: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.settlePdfConversionJobRequest(id, token, System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun interruptPdfConversionJob(id: String, token: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.interruptPdfConversionJob(id, token, System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun continuePdfConversionAfterWorkerSlice(id: String, token: String): Boolean = withContext(Dispatchers.IO) {
+        withLibraryOperation {
+            (dao.continuePdfConversionAfterWorkerSlice(id, token, System.currentTimeMillis()) > 0).also {
+                if (it) BookRepositoryOperationLock.release(token)
+            }
+        }
+    }
+
+    suspend fun forgetPdfConversionRunnerToken(token: String) = withContext(Dispatchers.IO) {
+        try {
+            withLibraryOperation(allowPendingRestore = true) {
+                dao.allPdfConversionJobs().firstOrNull { it.runnerToken == token }?.let { job ->
+                    dao.reconcileOrphanedPdfConversionJob(job.id, token, System.currentTimeMillis())
+                }
+            }
+        } finally {
+            BookRepositoryOperationLock.mutex.lock()
+            try {
+                BookRepositoryOperationLock.release(token)
+            } finally {
+                BookRepositoryOperationLock.mutex.unlock()
+            }
+        }
+    }
+
+    suspend fun reconcilePdfConversionJobs() = withContext(Dispatchers.IO) {
+        withLibraryOperation { reconcileOrphanedPdfConversionJobsUnlocked() }
+    }
+
+    private suspend fun reconcileOrphanedPdfConversionJobsUnlocked() {
+        val now = System.currentTimeMillis()
+        dao.allPdfConversionJobs().forEach { job ->
+            val token = job.runnerToken ?: return@forEach
+            if (!BookRepositoryOperationLock.isActive(token) &&
+                dao.reconcileOrphanedPdfConversionJob(job.id, token, now) > 0) {
+                BookRepositoryOperationLock.release(token)
+            }
         }
     }
 
@@ -501,6 +1010,7 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
     ) = withContext(Dispatchers.IO) {
         withLibraryOperation {
             check(!dao.hasActiveWebNovelJob()) { "Pause or cancel the active website EPUB job before exporting a backup." }
+            check(!dao.hasActivePdfConversionJob()) { "Pause or cancel the active PDF conversion before exporting a backup." }
             LibraryBackup(context, dao).export(uri, includeApiKey, password, onProgress)
         }
     }
@@ -520,6 +1030,9 @@ class BookRepository(private val context: Context, private val dao: BookDao) {
         withLibraryOperation {
             check(!dao.hasActiveWebNovelJob()) {
                 "Pause or cancel the active website EPUB job before restoring a backup."
+            }
+            check(!dao.hasActivePdfConversionJob()) {
+                "Pause or cancel the active PDF conversion before restoring a backup."
             }
             LibraryBackup(context, dao).restore(uri, password, replaceExistingSettings, replaceExistingGroqKey, onProgress)
         }
