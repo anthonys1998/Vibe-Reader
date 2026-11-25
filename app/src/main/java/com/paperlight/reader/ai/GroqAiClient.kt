@@ -308,7 +308,7 @@ private fun inferCoverSelector(sampleHtml: String, finalUrl: String, bookSelecto
 
     val semanticImages = runCatching {
         card.select("img[itemprop=image], img[class*=cover], img[id*=cover], .cover img, .book-cover img, .novel-cover img")
-    }.getOrDefault(emptyList()).filter(::hasImage)
+    }.getOrNull().orEmpty().filter(::hasImage)
     if (semanticImages.size == 1) return relativeSelector(card, semanticImages.single())
     if (semanticImages.size > 1) return null
 
@@ -334,14 +334,16 @@ private fun inferCoverSelector(sampleHtml: String, finalUrl: String, bookSelecto
 private fun relativeSelector(card: Element, target: Element): String? {
     val path = mutableListOf<String>()
     var element: Element? = target
-    while (element != null && element !== card) {
-        val tag = element.normalName().takeIf(String::isNotBlank) ?: return null
-        val classes = element.classNames().filter { CSS_IDENTIFIER.matches(it) }.take(2)
+    while (true) {
+        val current = element ?: break
+        if (current === card) break
+        val tag = current.normalName().takeIf(String::isNotBlank) ?: return null
+        val classes = current.classNames().filter { CSS_IDENTIFIER.matches(it) }.take(2)
         var part = tag + classes.joinToString("") { ".$it" }
-        val siblings = element.parent()?.children()?.filter { it.normalName() == tag }.orEmpty()
-        if (siblings.size > 1) part += ":nth-of-type(${siblings.indexOf(element) + 1})"
+        val siblings = current.parent()?.children()?.filter { it.normalName() == tag }.orEmpty()
+        if (siblings.size > 1) part += ":nth-of-type(${siblings.indexOf(current) + 1})"
         path += part
-        element = element.parent()
+        element = current.parent()
     }
     if (element !== card || path.isEmpty()) return null
     return path.asReversed().joinToString(" > ")
