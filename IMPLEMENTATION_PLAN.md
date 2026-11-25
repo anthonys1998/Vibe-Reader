@@ -85,7 +85,7 @@ The Room schema is now version 8 with explicit migrations and no destructive fal
 - [x] Add the Standard Ebooks cover-forward grid and cover/details popup, shared persistent grid/list preference, custom search-template hints, and in-scaffold Discover navigation with independent Add actions.
 - [ ] Verify Discover loading/empty/error states, details cancellation, drawer/back behavior, converter return, current source, and scroll restoration on Android devices.
 
-**Current verification:** The most recent recorded CI run passed unit tests and debug assembly, but the later popup cover-fallback and shared-layout refinements in this working tree have not yet been checked by CI. Device verification remains pending.
+**Current verification:** GitHub Actions [run 45518939581](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45518939581) on commit `36b675d` passed the unit-test/debug-assembly step and uploaded [Paperlight-debug artifact 14978033473](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45518939581/artifacts/14978033473). This pass supersedes an earlier run that transiently hit Maven Central HTTP 429. Android device and live Groq checks remain pending.
 
 **Status:** Partial: source management, built-in feeds, parsers, caching, EPUB validation, converter handoff, HTML detection/preview, the explicit bounded renderer fallback, and backward-compatible backup integration are implemented; Android device execution remains.
 

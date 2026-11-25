@@ -36,7 +36,7 @@ Both variants use the same application ID, `com.paperlight.reader`. Android will
 
 For a signed release, configure the four Android keystore secrets (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`) and `ANDROID_EXPECTED_CERT_SHA256`. Trusted pushes to `main` or `anthonys1998-Groq` can produce a release when those values are present. A manual signed-release request must be dispatched from one of those branches; it requires the same values and fails clearly when they are missing or invalid. The APK signer must match the configured expected fingerprint. Release version codes must be greater than 106 and greater than the version code of any installed APK you intend to update. The workflow does not pin the signer to the older run 66 debug artifact. Pull requests do not receive signing secrets.
 
-The latest recorded CI run passed unit tests and the debug build. The later Discover cover-fallback and shared-layout refinements in the current working tree have not yet been validated by CI. APK installation, signed-release production, background scheduling, and behavior on physical devices remain unverified here.
+GitHub Actions [run 45518939581](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45518939581) on commit `36b675d` passed the unit-test/debug-assembly step and uploaded [Paperlight-debug artifact 14978033473](https://github.com/anthonys1998/Vibe-Reader/actions/runs/45518939581/artifacts/14978033473). This pass supersedes an earlier run that transiently hit Maven Central HTTP 429. Device behavior and live Groq checks remain pending; APK installation, signed-release production, and background scheduling have not been verified here.
 
 ## Data and privacy
 
